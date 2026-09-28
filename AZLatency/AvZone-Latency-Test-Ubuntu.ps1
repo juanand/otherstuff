@@ -125,6 +125,8 @@
                   one stream per vCPU (-P nproc); UDP loss split into baseline (100 Mbps) vs
                   saturation; added RTT-under-load (bufferbloat) pass; removed near-zero sockperf
                   ping-pong loss column
+    2026092806  - switching boot diagnostics to the Microsoft-managed storage account
+                  (no custom diagnostics storage account is created any more)
 
 #>
 <#
@@ -188,22 +190,6 @@ param(
     #path to niping
     [string]$nipingpath
 )
-
-
-Function Get-RandomAlphanumericString {
-	
-	[CmdletBinding()]
-	Param (
-        [int] $length = 8
-	)
-
-	Begin{
-	}
-
-	Process{
-        Write-Output ( -join (( 0x61..0x7A) | Get-Random -Count $length  | % {[char]$_}) )
-	}	
-}
 
 
 Function Get-Percentile {
@@ -391,10 +377,6 @@ Function Get-AdvancedNetworkStats {
         Write-Host -ForegroundColor Green "Creating resource group"
         $ResourceGroup = New-AzResourceGroup -Location $region -Name $ResourceGroupName
 
-        # creating storage account for diagnostic information
-        $StorageAccountName = Get-RandomAlphanumericString
-        $StorageAccount = New-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName -SkuName Standard_LRS -Location $region
-    
         # create vNET and Subnet or getting existing
 	    if ($UseExistingVnet) {
             Write-Host -ForegroundColor Green "Getting existing vNET and Subnet Config"
@@ -433,7 +415,7 @@ Function Get-AdvancedNetworkStats {
             $VirtualMachine = Set-AzVMOperatingSystem -VM $VirtualMachine -Linux -ComputerName $ComputerName -Credential $Credential -DisablePasswordAuthentication:$false
             $VirtualMachine = Add-AzVMNetworkInterface -VM $VirtualMachine -Id $NIC.Id
             $VirtualMachine = Set-AzVMSourceImage -VM $VirtualMachine -PublisherName $OSPublisher -Offer $OSOffer -Skus $OSSku -Version $OSVersion
-            $VirtualMachine = Set-AzVMBootDiagnostic -VM $VirtualMachine -StorageAccountName $StorageAccountName -Enable -ResourceGroupName $ResourceGroupName
+            $VirtualMachine = Set-AzVMBootDiagnostic -VM $VirtualMachine -Enable
             $vm = New-AzVM -ResourceGroupName $ResourceGroupName -Location $region -VM $VirtualMachine -zone $zone -Verbose -AsJob
                 
         }
