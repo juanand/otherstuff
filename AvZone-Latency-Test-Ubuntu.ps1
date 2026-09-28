@@ -18,18 +18,18 @@
 
     Example output:
 
-        Region:  westeurope
+        Region:  uksouth
         VM Type:  Standard_D8s_v3
-        Latency:
+        Latency (qperf tcp_lat - one-way latency, i.e. ~half the round-trip, in us):
                  ----------------------------------------------
                  |    zone 1    |    zone 2    |    zone 3    |
         -------------------------------------------------------
-        | zone 1 |              |        xx us |        xx us |
-        | zone 2 |        xx us |              |        xx us |
-        | zone 3 |        xx us |        xx us |              |
+        | zone 1 |              |       xxx us |       xxx us |
+        | zone 2 |       xxx us |              |       xxx us |
+        | zone 3 |       xxx us |       xxx us |              |
         -------------------------------------------------------
 
-        Bandwidth:
+        Bandwidth (qperf tcp_bw, in MB/sec):
                  ----------------------------------------------
                  |    zone 1    |    zone 2    |    zone 3    |
         -------------------------------------------------------
@@ -37,6 +37,39 @@
         | zone 2 |   xxx MB/sec |              |   xxx MB/sec |
         | zone 3 |   xxx MB/sec |   xxx MB/sec |              |
         -------------------------------------------------------
+
+        sockperf one-way latency in us (one-way = ~half round-trip; comparable to the qperf latency table above):
+
+        From   To     OWAvg(us) OWP90(us) OWP99(us) OWMax(us)
+        ----   --     --------- --------- --------- ---------
+        zone 1 zone 2       xxx       xxx       xxx       xxx
+        zone 1 zone 3       xxx       xxx       xxx       xxx
+        zone 2 zone 3       xxx       xxx       xxx       xxx
+        zone 2 zone 1       xxx       xxx       xxx       xxx
+        zone 3 zone 1       xxx       xxx       xxx       xxx
+        zone 3 zone 2       xxx       xxx       xxx       xxx
+
+        sockperf full round-trip time (RTT) in us (--full-rtt pass):
+
+        From   To     RTTAvg(us) RTTP90(us) RTTP99(us) RTTMax(us)
+        ----   --     ---------- ---------- ---------- ----------
+        zone 1 zone 2        xxx        xxx        xxx        xxx
+        zone 1 zone 3        xxx        xxx        xxx        xxx
+        zone 2 zone 3        xxx        xxx        xxx        xxx
+        zone 2 zone 1        xxx        xxx        xxx        xxx
+        zone 3 zone 1        xxx        xxx        xxx        xxx
+        zone 3 zone 2        xxx        xxx        xxx        xxx
+
+        packet loss (sockperf UDP) and average throughput (iperf3, MB/sec to match qperf):
+
+        From   To     Loss(%) Tput(MB/s)
+        ----   --     ------- ----------
+        zone 1 zone 2    0.00        xxx
+        zone 1 zone 3    0.00        xxx
+        zone 2 zone 3    0.00        xxx
+        zone 2 zone 1    0.00        xxx
+        zone 3 zone 1    0.00        xxx
+        zone 3 zone 2    0.00        xxx
 
 .LINK
     https://github.com/Azure/SAP-on-Azure-Scripts-and-Utilities
