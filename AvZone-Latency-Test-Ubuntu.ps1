@@ -375,8 +375,23 @@ Function Get-AdvancedNetworkStats {
 
             # wait for cloud-init to finish so the apt/dpkg lock is free
             $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S cloud-init status --wait" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 300 -ErrorAction silentlycontinue
+            # make sure the universe repository (which provides sockperf/iperf3) is enabled
+            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S add-apt-repository -y universe" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 120 -ErrorAction silentlycontinue
             # run apt-get update first, then only install the tools if the update succeeded
             $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S sh -c 'DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y update && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y install qperf sockperf iperf3'" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 600
+            $installlog = $output.Output -join "`n"
+
+            # verify the three tools are actually present, warn (and show apt output) if any is missing
+            $check = Invoke-SSHCommand -Command "for t in qperf sockperf iperf3; do command -v `$t >/dev/null 2>&1 && echo `$t=ok || echo `$t=MISSING; done" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 30
+            $checktext = $check.Output -join "`n"
+            if ($checktext -match 'MISSING') {
+                Write-Host -ForegroundColor Red "VM$zone : one or more tools failed to install -> $($check.Output -join ' ')"
+                Write-Host -ForegroundColor Yellow ("VM$zone apt output (tail): " + (($installlog -split "`n" | Select-Object -Last 8) -join "`n"))
+            }
+            else {
+                Write-Host -ForegroundColor Green "VM$zone : qperf, sockperf and iperf3 installed"
+            }
+
             # start the measurement servers
             $output = Invoke-SSHCommand -Command "nohup qperf &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
             $output = Invoke-SSHCommand -Command "nohup sockperf server >/dev/null 2>&1 &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
