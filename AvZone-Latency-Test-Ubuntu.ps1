@@ -320,8 +320,8 @@ Function Get-RandomAlphanumericString {
 
             # wait for cloud-init to finish so the apt/dpkg lock is free
             $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S cloud-init status --wait" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 300 -ErrorAction silentlycontinue
-            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y update" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 300
-            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y install qperf" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 300
+            # run apt-get update first, then only install qperf if the update succeeded
+            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S sh -c 'DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y update && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y install qperf'" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 600
             $output = Invoke-SSHCommand -Command "nohup qperf &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
 
         }
