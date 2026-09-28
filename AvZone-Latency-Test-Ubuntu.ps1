@@ -6,6 +6,8 @@
 .DESCRIPTION
     The script creates VMs in Zone 1, 2 and 3, installing qperf on it and testing latency between VMs.
     This version uses Ubuntu 26.04 LTS and installs qperf via apt-get.
+    In addition to qperf it uses sockperf and iperf3 to report Average/P95/P99/Max RTT,
+    packet loss %, and average throughput between the zones.
 
 .PARAMETER Region
     The Azure region name
@@ -54,6 +56,8 @@
     2026092801  - switching to Ubuntu 26.04 LTS (Canonical image)
                 - installing qperf via apt-get instead of yum
                 - waiting for cloud-init to finish and using non-interactive apt
+    2026092802  - adding sockperf (RTT percentiles + packet loss) and iperf3 (throughput)
+                  to report Average/P95/P99/Max RTT, Packet Loss %, and Avg. Throughput
 
 #>
 <#
@@ -132,6 +136,57 @@ Function Get-RandomAlphanumericString {
 	Process{
         Write-Output ( -join (( 0x61..0x7A) | Get-Random -Count $length  | % {[char]$_}) )
 	}	
+}
+
+
+Function Get-AdvancedNetworkStats {
+    # Runs sockperf (RTT percentiles + packet loss over UDP) and iperf3 (TCP throughput)
+    # from the source VM's SSH session against the target IP and returns a result object.
+    [CmdletBinding()]
+    Param (
+        [int]    $SessionId,
+        [string] $TargetIp,
+        [string] $FromLabel,
+        [string] $ToLabel
+    )
+
+    # sockperf ping-pong, --full-rtt reports round-trip time instead of one-way latency
+    $sp = Invoke-SSHCommand -Command "sockperf ping-pong -i $TargetIp -t 10 --full-rtt" -SessionId $SessionId -TimeOut 60
+    $spText = $sp.Output -join "`n"
+
+    $avgRtt = if ($spText -match '(?:Round trip|Latency) is\s+([\d\.]+)') { [math]::Round([double]$Matches[1], 2) } else { $null }
+    $p95Rtt = if ($spText -match 'percentile 95\.000\s*=\s*([\d\.]+)')     { [math]::Round([double]$Matches[1], 2) } else { $null }
+    $p99Rtt = if ($spText -match 'percentile 99\.000\s*=\s*([\d\.]+)')     { [math]::Round([double]$Matches[1], 2) } else { $null }
+    $maxRtt = if ($spText -match '<MAX> observation\s*=\s*([\d\.]+)')       { [math]::Round([double]$Matches[1], 2) } else { $null }
+
+    $loss = $null
+    if ($spText -match 'SentMessages=(\d+);\s*ReceivedMessages=(\d+)') {
+        $sent = [double]$Matches[1]
+        $recv = [double]$Matches[2]
+        if ($sent -gt 0) { $loss = [math]::Round((($sent - $recv) / $sent) * 100, 3) }
+    }
+
+    # iperf3 TCP throughput, JSON output for reliable parsing
+    $ip = Invoke-SSHCommand -Command "iperf3 -c $TargetIp -t 10 -J" -SessionId $SessionId -TimeOut 60
+    $throughputMbps = $null
+    try {
+        $ipjson = ($ip.Output -join "`n") | ConvertFrom-Json
+        if ($ipjson.end.sum_received.bits_per_second) {
+            $throughputMbps = [math]::Round($ipjson.end.sum_received.bits_per_second / 1e6, 1)
+        }
+    }
+    catch { }
+
+    [PSCustomObject]@{
+        From         = $FromLabel
+        To           = $ToLabel
+        'AvgRTT(us)' = $avgRtt
+        'P95RTT(us)' = $p95Rtt
+        'P99RTT(us)' = $p99Rtt
+        'MaxRTT(us)' = $maxRtt
+        'Loss(%)'    = $loss
+        'Tput(Mbps)' = $throughputMbps
+    }
 }
 
     $breakingchangewarning = Get-AzConfig -DisplayBreakingChangeWarning
@@ -315,14 +370,17 @@ Function Get-RandomAlphanumericString {
     # run qperf test
     if ($testtool -eq "qperf") {
         # install qperf on all VMs
-        Write-Host -ForegroundColor Green "Installing qperf on all VMs"
+        Write-Host -ForegroundColor Green "Installing qperf, sockperf and iperf3 on all VMs"
         For ($zone=1; $zone -le $zones; $zone++) {
 
             # wait for cloud-init to finish so the apt/dpkg lock is free
             $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S cloud-init status --wait" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 300 -ErrorAction silentlycontinue
-            # run apt-get update first, then only install qperf if the update succeeded
-            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S sh -c 'DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y update && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y install qperf'" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 600
+            # run apt-get update first, then only install the tools if the update succeeded
+            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S sh -c 'DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y update && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y install qperf sockperf iperf3'" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 600
+            # start the measurement servers
             $output = Invoke-SSHCommand -Command "nohup qperf &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
+            $output = Invoke-SSHCommand -Command "nohup sockperf server >/dev/null 2>&1 &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
+            $output = Invoke-SSHCommand -Command "nohup iperf3 -s >/dev/null 2>&1 &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
 
         }
 
@@ -360,6 +418,23 @@ Function Get-RandomAlphanumericString {
             $bandwidthtemp = $bandwidthtemp.substring($bandwidthtemp.IndexOf("=")+3)
             $bandwidthtemp = $bandwidthtemp.PadLeft(12)
             $bandwidth[$zone -1][$vmtopingno2 -1] = $bandwidthtemp
+
+        }
+
+        # run sockperf (RTT percentiles + packet loss) and iperf3 (throughput) tests
+        Write-Host -ForegroundColor Green "Running sockperf and iperf3 RTT / packet loss / throughput tests"
+        $advresults = @()
+        For ($zone=1; $zone -le $zones; $zone++) {
+
+            $vmtopingno1 = (( $zone   %3)+1)
+            $vmtoping1 = $VMPrefix + $vmtopingno1
+            $ipaddresstoping1 = $ipaddresses[$vmtoping1]
+            $vmtopingno2 = ((($zone+1)%3)+1)
+            $vmtoping2 = $VMPrefix + $vmtopingno2
+            $ipaddresstoping2 = $ipaddresses[$vmtoping2]
+
+            $advresults += Get-AdvancedNetworkStats -SessionId $sshsessions[$zone-1].SessionId -TargetIp $ipaddresstoping1 -FromLabel "zone $zone" -ToLabel "zone $vmtopingno1"
+            $advresults += Get-AdvancedNetworkStats -SessionId $sshsessions[$zone-1].SessionId -TargetIp $ipaddresstoping2 -FromLabel "zone $zone" -ToLabel "zone $vmtopingno2"
 
         }
     }
@@ -448,6 +523,12 @@ Function Get-RandomAlphanumericString {
     Write-Host "| zone 2 |" $bandwidth[1][0] "|              |" $bandwidth[1][2] "|"
     Write-Host "| zone 3 |" $bandwidth[2][0] "|" $bandwidth[2][1] "|              |"
     Write-Host "-------------------------------------------------------"
+
+    if ($advresults) {
+        Write-Host ""
+        Write-Host "RTT (sockperf, full round-trip in us), packet loss and throughput (iperf3):"
+        $advresults | Format-Table -AutoSize | Out-Host
+    }
 
 
     # Removing SSH sessions
