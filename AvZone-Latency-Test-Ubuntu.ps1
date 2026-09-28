@@ -6,8 +6,9 @@
 .DESCRIPTION
     The script creates VMs in Zone 1, 2 and 3, installing qperf on it and testing latency between VMs.
     This version uses Ubuntu 26.04 LTS and installs qperf via apt-get.
-    In addition to qperf it uses sockperf and iperf3 to report Average/P95/P99/Max RTT,
-    packet loss %, and average throughput between the zones.
+    In addition to qperf it uses sockperf (two passes: one-way latency and full round-trip
+    RTT, each reporting Average/P90/P99/Max plus packet loss) and iperf3 (average throughput
+    in MB/sec) between the zones.
 
 .PARAMETER Region
     The Azure region name
@@ -58,6 +59,9 @@
                 - waiting for cloud-init to finish and using non-interactive apt
     2026092802  - adding sockperf (RTT percentiles + packet loss) and iperf3 (throughput)
                   to report Average/P95/P99/Max RTT, Packet Loss %, and Avg. Throughput
+    2026092803  - sockperf now runs two passes (one-way latency and full round-trip RTT),
+                  percentiles switched to P90/P99 (sockperf has no P95), iperf3 throughput
+                  reported in MB/sec, and qperf tables relabelled (one-way latency / MB/sec)
 
 #>
 <#
@@ -140,8 +144,10 @@ Function Get-RandomAlphanumericString {
 
 
 Function Get-AdvancedNetworkStats {
-    # Runs sockperf (RTT percentiles + packet loss over UDP) and iperf3 (TCP throughput)
-    # from the source VM's SSH session against the target IP and returns a result object.
+    # Runs sockperf twice (one-way latency and full round-trip RTT, over UDP) plus iperf3
+    # (TCP throughput) from the source VM's SSH session against the target IP, returning one
+    # result object. sockperf's default report is one-way latency; --full-rtt reports the
+    # full round trip. sockperf's fixed percentile set has P90/P99 but no P95.
     [CmdletBinding()]
     Param (
         [int]    $SessionId,
@@ -150,29 +156,37 @@ Function Get-AdvancedNetworkStats {
         [string] $ToLabel
     )
 
-    # sockperf ping-pong, --full-rtt reports round-trip time instead of one-way latency
-    $sp = Invoke-SSHCommand -Command "sockperf ping-pong -i $TargetIp -t 10 --full-rtt" -SessionId $SessionId -TimeOut 60
-    $spText = $sp.Output -join "`n"
+    # pass 1: one-way latency (sockperf default, comparable to qperf's half round-trip)
+    $spOne  = Invoke-SSHCommand -Command "sockperf ping-pong -i $TargetIp -t 10" -SessionId $SessionId -TimeOut 60
+    $owText = $spOne.Output -join "`n"
+    $owAvg = if ($owText -match '(?:Round trip|Latency) is\s+([\d\.]+)') { [math]::Round([double]$Matches[1], 2) } else { $null }
+    $owP90 = if ($owText -match 'percentile 90\.000\s*=\s*([\d\.]+)')     { [math]::Round([double]$Matches[1], 2) } else { $null }
+    $owP99 = if ($owText -match 'percentile 99\.000\s*=\s*([\d\.]+)')     { [math]::Round([double]$Matches[1], 2) } else { $null }
+    $owMax = if ($owText -match '<MAX> observation\s*=\s*([\d\.]+)')       { [math]::Round([double]$Matches[1], 2) } else { $null }
 
-    $avgRtt = if ($spText -match '(?:Round trip|Latency) is\s+([\d\.]+)') { [math]::Round([double]$Matches[1], 2) } else { $null }
-    $p95Rtt = if ($spText -match 'percentile 95\.000\s*=\s*([\d\.]+)')     { [math]::Round([double]$Matches[1], 2) } else { $null }
-    $p99Rtt = if ($spText -match 'percentile 99\.000\s*=\s*([\d\.]+)')     { [math]::Round([double]$Matches[1], 2) } else { $null }
-    $maxRtt = if ($spText -match '<MAX> observation\s*=\s*([\d\.]+)')       { [math]::Round([double]$Matches[1], 2) } else { $null }
+    # pass 2: full round-trip RTT (--full-rtt)
+    $spRtt   = Invoke-SSHCommand -Command "sockperf ping-pong -i $TargetIp -t 10 --full-rtt" -SessionId $SessionId -TimeOut 60
+    $rttText = $spRtt.Output -join "`n"
+    $rttAvg = if ($rttText -match '(?:Round trip|Latency) is\s+([\d\.]+)') { [math]::Round([double]$Matches[1], 2) } else { $null }
+    $rttP90 = if ($rttText -match 'percentile 90\.000\s*=\s*([\d\.]+)')     { [math]::Round([double]$Matches[1], 2) } else { $null }
+    $rttP99 = if ($rttText -match 'percentile 99\.000\s*=\s*([\d\.]+)')     { [math]::Round([double]$Matches[1], 2) } else { $null }
+    $rttMax = if ($rttText -match '<MAX> observation\s*=\s*([\d\.]+)')       { [math]::Round([double]$Matches[1], 2) } else { $null }
 
+    # packet loss from the full-rtt pass
     $loss = $null
-    if ($spText -match 'SentMessages=(\d+);\s*ReceivedMessages=(\d+)') {
+    if ($rttText -match 'SentMessages=(\d+);\s*ReceivedMessages=(\d+)') {
         $sent = [double]$Matches[1]
         $recv = [double]$Matches[2]
         if ($sent -gt 0) { $loss = [math]::Round((($sent - $recv) / $sent) * 100, 3) }
     }
 
-    # iperf3 TCP throughput, JSON output for reliable parsing
+    # iperf3 TCP throughput, reported in MB/sec (bytes) to match qperf's tcp_bw table
     $ip = Invoke-SSHCommand -Command "iperf3 -c $TargetIp -t 10 -J" -SessionId $SessionId -TimeOut 60
-    $throughputMbps = $null
+    $throughputMBs = $null
     try {
         $ipjson = ($ip.Output -join "`n") | ConvertFrom-Json
         if ($ipjson.end.sum_received.bits_per_second) {
-            $throughputMbps = [math]::Round($ipjson.end.sum_received.bits_per_second / 1e6, 1)
+            $throughputMBs = [math]::Round($ipjson.end.sum_received.bits_per_second / 8e6, 1)
         }
     }
     catch { }
@@ -180,12 +194,16 @@ Function Get-AdvancedNetworkStats {
     [PSCustomObject]@{
         From         = $FromLabel
         To           = $ToLabel
-        'AvgRTT(us)' = $avgRtt
-        'P95RTT(us)' = $p95Rtt
-        'P99RTT(us)' = $p99Rtt
-        'MaxRTT(us)' = $maxRtt
+        'OWAvg(us)'  = $owAvg
+        'OWP90(us)'  = $owP90
+        'OWP99(us)'  = $owP99
+        'OWMax(us)'  = $owMax
+        'RTTAvg(us)' = $rttAvg
+        'RTTP90(us)' = $rttP90
+        'RTTP99(us)' = $rttP99
+        'RTTMax(us)' = $rttMax
         'Loss(%)'    = $loss
-        'Tput(Mbps)' = $throughputMbps
+        'Tput(MB/s)' = $throughputMBs
     }
 }
 
@@ -436,8 +454,8 @@ Function Get-AdvancedNetworkStats {
 
         }
 
-        # run sockperf (RTT percentiles + packet loss) and iperf3 (throughput) tests
-        Write-Host -ForegroundColor Green "Running sockperf and iperf3 RTT / packet loss / throughput tests"
+        # run sockperf (one-way + full RTT, packet loss) and iperf3 (throughput) tests
+        Write-Host -ForegroundColor Green "Running sockperf (one-way + full RTT) and iperf3 throughput tests"
         $advresults = @()
         For ($zone=1; $zone -le $zones; $zone++) {
 
@@ -518,7 +536,7 @@ Function Get-AdvancedNetworkStats {
     Write-Host "Region: " $region
     Write-Host "VM Type: " $VMSize
 
-    Write-Host "Latency:"
+    Write-Host "Latency (qperf tcp_lat - one-way latency, i.e. ~half the round-trip, in us):"
 
     Write-Host "         ----------------------------------------------"
     Write-Host "         |    zone 1    |    zone 2    |    zone 3    |"
@@ -529,7 +547,7 @@ Function Get-AdvancedNetworkStats {
     Write-Host "-------------------------------------------------------"
 
     Write-Host ""
-    Write-Host "Bandwidth:"
+    Write-Host "Bandwidth (qperf tcp_bw, in MB/sec):"
 
     Write-Host "         ----------------------------------------------"
     Write-Host "         |    zone 1    |    zone 2    |    zone 3    |"
@@ -541,8 +559,14 @@ Function Get-AdvancedNetworkStats {
 
     if ($advresults) {
         Write-Host ""
-        Write-Host "RTT (sockperf, full round-trip in us), packet loss and throughput (iperf3):"
-        $advresults | Format-Table -AutoSize | Out-Host
+        Write-Host "sockperf one-way latency in us (one-way = ~half round-trip; comparable to the qperf latency table above):"
+        $advresults | Format-Table From, To, 'OWAvg(us)', 'OWP90(us)', 'OWP99(us)', 'OWMax(us)' -AutoSize | Out-Host
+
+        Write-Host "sockperf full round-trip time (RTT) in us (--full-rtt pass):"
+        $advresults | Format-Table From, To, 'RTTAvg(us)', 'RTTP90(us)', 'RTTP99(us)', 'RTTMax(us)' -AutoSize | Out-Host
+
+        Write-Host "packet loss (sockperf UDP) and average throughput (iperf3, MB/sec to match qperf):"
+        $advresults | Format-Table From, To, 'Loss(%)', 'Tput(MB/s)' -AutoSize | Out-Host
     }
 
 
