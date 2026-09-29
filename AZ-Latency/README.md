@@ -1,115 +1,192 @@
-# AvZone-Latency-Test-Ubuntu
+# About
 
-A PowerShell tool that measures **network latency, round-trip time, throughput, packet loss
-and jitter between Azure Availability Zones** in a region. It creates one Ubuntu 26.04 LTS VM
-per zone (zones 1, 2, 3), installs the measurement tools, runs a battery of tests between every
-zone pair, prints the results as tables, and (optionally) tears everything down.
+Old [SAP script](https://github.com/Azure/SAP-on-Azure-Scripts-and-Utilities/blob/main/AvZone-Latency-Test/Readme.md) rely on qperf and old CentOS image that does not work anymore.
+This vive-coding version uses qperf on Ubuntu, and adds iperf3 and sockperf to get additional details.
 
-> Script: [`AvZone-Latency-Test-Ubuntu.ps1`](AvZone-Latency-Test-Ubuntu.ps1)
+On top of that, this approach leverages a controller VM to run the script, to make it work with high restricted environments:
+- Execution VM does not have SSH access to the test VMs.
+- We use controller VM and its system-assigned identity to run the script.
+- VMs don't have public IPs.
 
-## What it does
 
-1. Creates a resource group, VNet/subnet, NSG (SSH only), a diagnostics storage account, and
-   three zonal VMs with Accelerated Networking (or reuses existing ones / an existing VNet).
-2. Opens SSH sessions (Posh-SSH) and installs **qperf**, **sockperf** and **iperf3** from the
-   Ubuntu `universe` repo, then starts their servers.
-3. Runs latency/throughput tests between all six ordered zone pairs.
-4. Prints qperf tables plus five advanced tables (sockperf + iperf3).
-5. Deletes the resource group unless `-DestroyAfterTest $false`.
-
-## Requirements
-
-- PowerShell **7.1+**
-- Modules: **Az.Compute**, **Posh-SSH 3.0+**
-- An authenticated Azure session (`Connect-AzAccount`) with quota for **3 x** the chosen VM size
-- Outbound SSH (22) to the VMs' public IPs (default), or direct connectivity if `-UseExistingVnet`
-
-## Usage
+# Create Controller VM
 
 ```powershell
-./AvZone-Latency-Test-Ubuntu.ps1 -SubscriptionName "My Subscription" -region uksouth
+# Params
+$RESOURCE_GROUP = "rg-az-latency-test"
+$LOCATION       = "uksouth"
+$VNET_NAME      = "rg-latency-vnet"
+$VNET_PREFIX    = "10.0.0.0/16"
+$SUBNET_NAME    = "subnet"
+$SUBNET_PREFIX  = "10.0.1.0/24"
+$VM_NAME        = "controller"
+$VM_SKU         = "Standard_D2s_v5"
+$VM_IMAGE       = "Canonical:ubuntu-26_04-lts:server:latest"
+$VM_ROLE        = "Contributor"
+$ADMIN_USER     = "azureuser"
+$ADMIN_PASSWORD = "{password}"
+
+# Create RG
+az group create `
+  --name $RESOURCE_GROUP `
+  --location $LOCATION
+
+# Create VNet
+az network vnet create `
+  --resource-group $RESOURCE_GROUP `
+  --name $VNET_NAME `
+  --address-prefixes $VNET_PREFIX `
+  --location $LOCATION
+
+# Create subnet
+az network vnet subnet create `
+  --resource-group $RESOURCE_GROUP `
+  --vnet-name $VNET_NAME `
+  --name $SUBNET_NAME `
+  --address-prefixes $SUBNET_PREFIX `
+  --default-outbound true
+
+# Create controller VM
+az vm create `
+  --resource-group $RESOURCE_GROUP `
+  --name $VM_NAME `
+  --image $VM_IMAGE `
+  --size $VM_SKU `
+  --vnet-name $VNET_NAME `
+  --subnet $SUBNET_NAME `
+  --admin-username $ADMIN_USER `
+  --admin-password $ADMIN_PASSWORD `
+  --public-ip-address "" `
+  --nsg "" `
+  --boot-diagnostics-storage ""
+  
+# Enable Serial Console
+  az vm boot-diagnostics enable `
+  --resource-group $RESOURCE_GROUP ` --name $VM_NAME
+  
+# Enable system-assigned managed identity
+az vm identity assign `
+  --resource-group $RESOURCE_GROUP `
+  --name $VM_NAME
+  
+# Grant contributor over RG to controller VM
+$PRINCIPAL_ID = (az vm identity show `
+  --resource-group $RESOURCE_GROUP `
+  --name $VM_NAME `
+  --query principalId `
+  --output tsv)
+
+$SUBSCRIPTION_ID = (az account show --query id --output tsv)
+
+az role assignment create `
+  --assignee $PRINCIPAL_ID `
+  --role $VM_ROLE `
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP"
+
 ```
 
-Common parameters:
+# Prepare Controller VM
 
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| `-SubscriptionName` | (required) | Azure subscription to use |
-| `-region` | `westeurope` | Azure region to test |
-| `-VMSize` | `Standard_D8s_v3` | VM size (must support 3 zones + Accelerated Networking) |
-| `-DestroyAfterTest` | `$true` | Delete the resource group when finished |
-| `-UseExistingVMs` | `$false` | Reuse VMs from a previous run |
-| `-UseExistingVnet` | `$false` | Deploy into an existing VNet (direct SSH required) |
-| `-UsePublicIPAddresses` | `$true` | Connect over public IPs |
-| `-testtool` | `qperf` | `qperf` or `niping` for the first latency/bandwidth tables |
+Install PowerShell 
+```bash
+# Install PowerShell
+sudo apt update
 
-## What it measures
+# Install pre-requisite packages.
+sudo apt install -y wget apt-transport-https software-properties-common
 
-| Tool | Metric | Notes |
-|------|--------|-------|
-| **qperf** | one-way latency (`tcp_lat`), single-stream bandwidth (`tcp_bw`, MB/s) | first two tables |
-| **sockperf** | idle **one-way** latency and idle **full RTT** (avg / P90 / P99 / Max) | UDP ping-pong, small messages |
-| **sockperf** | **RTT under load** (avg + P99) | RTT sampled *while* an iperf3 TCP transfer saturates the link (bufferbloat) |
-| **iperf3 TCP** | **single-flow** throughput (avg / P90 / P99 / Max, MB/s) + **retransmits** | `-O 1` drops TCP slow-start from the average; percentiles from 0.1 s samples |
-| **iperf3 TCP** | **aggregate** throughput (MB/s) | one stream per vCPU (`-P nproc`); approaches the VM's NIC cap |
-| **iperf3 UDP** | packet loss % and jitter (ms) at a **baseline** rate (100 Mbps) | organic loss on a non-saturated path |
-| **iperf3 UDP** | throughput, packet loss % and jitter at **saturation** (~the TCP rate) | load-induced loss |
+# Download the Microsoft repository GPG keys
+. /etc/os-release
+wget -q https://packages.microsoft.com/config/$ID/$VERSION_ID/packages-microsoft-prod.deb
 
-All throughput is reported in **MB/sec (bytes)** to line up with qperf's `tcp_bw` table.
+# Register the Microsoft repository GPG keys
+sudo dpkg -i packages-microsoft-prod.deb
 
-## Methodology caveats
+# Remove GPG keys file
+rm ./packages-microsoft-prod.deb
 
-1. **Sequential, single-sample.** Each zone pair is measured once, and the qperf / sockperf /
-   iperf3 phases run seconds-to-minutes apart — they are not a synchronized snapshot. Tails
-   (`Max`, `P99`) from a single ~10 s run are noisy and not perfectly reproducible.
-2. **Idle vs. under-load latency are now both measured.** The sockperf idle tables show best-case
-   latency on an empty pipe; the *RTT under load* table shows latency while the link is saturated
-   (bufferbloat). Compare the two to judge how latency degrades under traffic.
-3. **One-way = half of RTT is an assumption.** Both qperf and the sockperf one-way pass derive
-   one-way latency as RTT/2, which assumes a symmetric path. Azure routing can be asymmetric, so
-   treat one-way figures as approximations.
-4. **Single-flow vs. aggregate throughput are now both measured.** A single TCP flow is often
-   CPU/single-queue bound and under-reports the VM's NIC capacity; the aggregate pass
-   (`-P` = vCPU count) is a better estimate of maximum bandwidth. Neither guarantees the SKU's
-   documented ceiling.
-5. **0.1 s throughput percentiles + warm-up drop.** Percentiles come from 0.1 s interval samples;
-   `-O 1` removes the first second (slow-start) from the *average*, but sub-second bursts
-   (TSO/GSO/coalescing) can still make throughput `Max`/`P99` momentarily exceed the sustainable
-   rate. These are **throughput** percentiles, not latency percentiles.
-6. **Servers are backgrounded, not daemonized.** qperf/sockperf/iperf3 servers run via `nohup`
-   for the life of the VM boot (no systemd units, no reboot persistence). If a server died, the
-   affected metric would read blank/zero rather than error.
-7. **Noisy-neighbour / host variance.** Azure VMs share physical hosts; latency and throughput
-   vary with host load and placement and are not fully reproducible.
-8. **Runtime.** The advanced phase issues ~7 SSH-driven test runs per pair (2 sockperf idle,
-   1 under-load, 2 TCP, 2 UDP) x 6 pairs — budget several minutes for that phase alone.
+# Update the list of packages again
+sudo apt update
 
-## Realistic vs. artificial measurements
+# Install PowerShell
+sudo apt-get install -y powershell
+```
 
-**Trustworthy / realistic**
+Alternatively, if `apt-get` complains about cannot find PowerShell (24.04 works, 26.04 fails), try:
+```bash
+wget https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/powershell_7.6.6-1.deb_amd64.deb
+sudo dpkg -i powershell_7.6.6-1.deb_amd64.deb
+```
 
-- **qperf latency, sockperf idle one-way avg, sockperf idle RTT avg + P90/P99** — best-case idle
-  latency and its tail.
-- **RTT under load (bufferbloat)** — a real, useful signal of latency degradation under saturation.
-- **iperf3 TCP single-flow avg** — realistic single-connection throughput (warm-up excluded).
-- **iperf3 TCP aggregate** — realistic near-max throughput for the VM using parallel streams.
-- **TCP retransmits** — a genuine path-quality signal.
-- **iperf3 UDP baseline loss/jitter (100 Mbps)** — organic loss/jitter on a non-saturated path.
+Install needed PowerShell Modules:
+```PowerShell
+Install-Module Az -Force
+Install-Module -Name Posh-SSH -Force
+```
 
-**Artificial / interpret with caution**
+Download scripts from GitHub:
+```bash
+# Originals in https://github.com/Azure/SAP-on-Azure-Scripts-and-Utilities
+wget https://raw.githubusercontent.com/juanand/otherstuff/main/AZ-Latency/AvZone-Latency-Test/AvZone-Latency-Test.ps1
+wget https://raw.githubusercontent.com/juanand/otherstuff/main/AZ-Latency/AvZone-Mapping/AvZone-Mapping.ps1
+wget https://raw.githubusercontent.com/juanand/otherstuff/main/AZ-Latency/Get-VM-by-Zones/Get-VMs-by-Zone.ps1
+```
 
-- **iperf3 UDP *saturation* loss/jitter** — the most artificial metric. UDP is open-loop and we
-  deliberately send at ~the TCP rate, so any loss is *load-induced by that chosen rate*, not a
-  natural loss rate. Read it as "loss when blasting UDP at ~line rate", and compare it against the
-  baseline column.
-- **One-way latency values** — approximations (symmetric-path assumption).
-- **Throughput `P99`/`Max`** — can be inflated by sub-second bursts at 0.1 s granularity.
-- **Single 10 s sample** — tails vary run-to-run; average several runs for stability if needed.
 
-## Notes
+# AvZone-Latency-Test.ps1
 
-- iperf3 has no latency measurement, so **latency percentiles come from sockperf**; iperf3
-  percentiles are **throughput** percentiles.
-- sockperf's fixed percentile set provides **P90 and P99 but not P95**.
-- `qperf tcp_lat` reports roughly one-way latency (~half the round trip); the sockperf idle
-  one-way table is directly comparable, and the full-RTT table is roughly double it.
+Create a screen session in Serial Console to avoid timeouts
+```bash
+screen -S pwsh
+# To reconnect, screen -r pwsh
+```
+
+Inside screen, run `pwsh` and then:
+```PowerShell
+# Authenticate with system-assigned identity
+Connect-AzAccount -Identity
+
+# Run script
+$SUB_NAME       = "{subscriptionName}"
+$RESOURCE_GROUP = "rg-az-latency-test"
+$LOCATION       = "uksouth"
+$VNET_NAME      = "rg-latency-vnet"
+$SUBNET_NAME    = "subnet"
+$ADMIN_USER     = "azureuser"
+$ADMIN_PASSWORD = "{password}"
+
+./AvZone-Latency-Test.ps1 `
+  -subscriptionName $SUB_NAME `
+  -region $LOCATION `
+  -ResourceGroupName $RESOURCE_GROUP `
+  -DestroyAfterTest $FALSE `
+  -UseExistingVMs $FALSE `
+  -UseExistingVnet $TRUE `
+  -NetworkName $VNET_NAME `
+  -SubnetName $SUBNET_NAME `
+  -ResourceGroupNameNetwork $RESOURCE_GROUP `
+  -UsePublicIPAddresses $FALSE `
+  -VMLocalAdminUser $ADMIN_USER `
+  -VMLocalAdminPassword $ADMIN_PASSWORD `
+    
+```
+
+You may adjust parameters to meet your needs.
+For example, -UseExistingVMs set to TRUE for first pass and FALSE for later passes to get newer report, etc.
+
+See repo for more details.
+
+# AvZone-Mapping.ps1
+
+Register feature for the subscriptions:
+```PowerShell
+Register-AzProviderFeature -FeatureName AvailabilityZonePeering -ProviderNamespace Microsoft.Resources
+```
+
+Then run from Cloud Shell or your own shell get subscriptions AZ mappings.
+```PowerShell
+./Avzone-Mapping.ps1 -subscriptionId {sub1} -subscriptionPeers {sub1},{sub2},{subN} -region {regionName}
+```
+
+# Get-VMs-by-Zone.ps1
+Simply run from Cloud Shell or your own shell to get VM SKUs per AZ.
