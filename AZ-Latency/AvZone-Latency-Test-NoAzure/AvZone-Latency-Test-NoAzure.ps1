@@ -322,6 +322,16 @@ Function Get-AdvancedNetworkStats {
     $sshsessions = Get-SSHSession
 
 
+    # get the Hyper-V KVP physical host name for each VM (SSH only, no Azure control plane)
+    Write-Host -ForegroundColor Green "Getting Hosts for virtual machines"
+    For ($zone=1; $zone -le $zones; $zone++) {
+
+        $output = Invoke-SSHCommand -Command "strings /var/lib/hyperv/.kvp_pool_3 | sed -n '2 p'" -SessionId $sshsessions[$zone-1].SessionId
+        Write-Host ("zone $zone : " + $output.Output)
+
+    }
+
+
     # run qperf test
     if ($testtool -eq "qperf") {
         # install qperf on all VMs
