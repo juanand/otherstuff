@@ -34,7 +34,7 @@ def create_resource_group(resource_client, resource_group_name, location):
     """
     resource_group_params = {'location': location}
     resource_client.resource_groups.create_or_update(resource_group_name, resource_group_params)
-    logging.info("Resource group %s has been 建立.", resource_group_name)
+    logging.info("Resource group %s has been created.", resource_group_name)
 
 def create_virtual_network(network_client, resource_group_name, vnet_name, subnet_name, network_cidr, location):
     """
@@ -55,7 +55,7 @@ def create_virtual_network(network_client, resource_group_name, vnet_name, subne
         }
     }
     network_client.virtual_networks.begin_create_or_update(resource_group_name, vnet_name, vnet_params).result()
-    logging.info("VNet %s has been 建立.", vnet_name)
+    logging.info("VNet %s has been created.", vnet_name)
 
     subnet_info = network_client.subnets.begin_create_or_update(
         resource_group_name,
@@ -65,7 +65,7 @@ def create_virtual_network(network_client, resource_group_name, vnet_name, subne
             'address_prefix': network_cidr
         }
     ).result()
-    logging.info("Subnet %s has been 建立.", subnet_name)
+    logging.info("Subnet %s has been created.", subnet_name)
 
 def create_network_security_group(network_client, resource_group_name, nsg_name, location):
     """
@@ -163,7 +163,7 @@ def create_network_security_group(network_client, resource_group_name, nsg_name,
 
     nsg_params = NetworkSecurityGroup(location=location, security_rules=[ssh_rule, iperf3_rule, icmp_rule, asn_rule, sockperf_rule,two_ping_rule, outbound_rule])
     network_client.network_security_groups.begin_create_or_update(resource_group_name, nsg_name, nsg_params).result()
-    logging.info("Network security group %s has been 建立.", nsg_name)
+    logging.info("Network security group %s has been created.", nsg_name)
 
 def create_vm_without_progress(compute_client, network_client, resource_client, resource_group_name, vm_name, location, vm_type, username, password, nsg_name, vnet_name, subnet_name, zone, enable_accelerated_networking):
     """
@@ -231,7 +231,7 @@ def create_vm_without_progress(compute_client, network_client, resource_client, 
         'zones': [zone]
     }
     compute_client.virtual_machines.begin_create_or_update(resource_group_name, vm_name, vm_params).result()
-    logging.info("VM %s has been 建立.", vm_name)
+    logging.info("VM %s has been created.", vm_name)
     return nic.ip_configurations[0].private_ip_address
 
 def get_private_ip_address(network_client, resource_group_name, vm_name):
