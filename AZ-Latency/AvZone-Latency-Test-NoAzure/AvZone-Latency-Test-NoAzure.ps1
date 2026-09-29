@@ -1,132 +1,80 @@
 <#
 
 .SYNOPSIS
-    Creates VMs and tests latency between VMs
+    Runs network performance tests between three pre-existing Linux VMs (no Azure deployment).
 
 .DESCRIPTION
-    The script creates VMs in Zone 1, 2 and 3, installing qperf on it and testing latency between VMs.
-    This version uses Ubuntu 26.04 LTS and installs qperf via apt-get.
-    In addition to qperf it uses sockperf (idle one-way latency, idle full round-trip RTT,
-    and RTT under load / bufferbloat) and iperf3 (TCP single-flow throughput with warm-up
-    dropped plus retransmits, TCP aggregate throughput over one stream per vCPU, and UDP
-    packet loss / jitter at a baseline rate and at saturation), between the zones.
+    This is a standalone, "tests only" variant of AvZone-Latency-Test.ps1. It does NOT deploy
+    any Azure infrastructure and has NO dependency on the Azure control plane: it does not import
+    the Az PowerShell modules and never calls Connect-AzAccount / Select-AzSubscription. The
+    controller running this script does not need an Azure identity.
+
+    You supply the connection endpoints (IP addresses or resolvable host names) of three VMs that
+    have already been created out of band (in three different Availability Zones, or anywhere).
+    The script opens SSH sessions to them (Posh-SSH), installs the measurement tools, and runs the
+    same qperf / sockperf / iperf3 tests as the original script:
+
+        qperf    : one-way latency (tcp_lat) and bandwidth (tcp_bw)
+        sockperf : idle one-way latency, idle full round-trip RTT, and RTT under load (bufferbloat)
+        iperf3   : TCP single-flow throughput (avg/P90/P99/max + retransmits), TCP aggregate
+                   throughput over one stream per vCPU, and UDP packet loss / jitter at a baseline
+                   rate and at saturation
+
+    If the VMs are reached over a public IP but must test each other over a private IP, pass the
+    private addresses via -Zone1TestIp / -Zone2TestIp / -Zone3TestIp.
+
+.PARAMETER Zone1
+    IP address or host name used to SSH into the VM in zone 1.
+
+.PARAMETER Zone2
+    IP address or host name used to SSH into the VM in zone 2.
+
+.PARAMETER Zone3
+    IP address or host name used to SSH into the VM in zone 3.
+
+.PARAMETER Zone1TestIp
+    Optional address the other VMs use to reach zone 1 for the actual measurements (e.g. the
+    private IP). Defaults to -Zone1 when omitted.
+
+.PARAMETER Zone2TestIp
+    Optional address the other VMs use to reach zone 2. Defaults to -Zone2 when omitted.
+
+.PARAMETER Zone3TestIp
+    Optional address the other VMs use to reach zone 3. Defaults to -Zone3 when omitted.
+
+.PARAMETER VMLocalAdminUser
+    SSH user name (same on all three VMs).
+
+.PARAMETER VMLocalAdminPassword
+    SSH password (same on all three VMs). Ignored when -SSHKeyFilePath is supplied.
+
+.PARAMETER SSHKeyFilePath
+    Optional path to a private key file for key-based SSH authentication.
+
+.PARAMETER testtool
+    "qperf" (default) or "niping".
+
+.PARAMETER nipingpath
+    Download URL for the niping executable (only used when -testtool niping).
 
 .PARAMETER Region
-    The Azure region name
+    Free-text label shown in the report header (informational only).
+
+.PARAMETER VMSize
+    Free-text label shown in the report header (informational only).
 
 .EXAMPLE
-    ./AvZone-Latency-Test-Ubuntu.ps1 -SubscriptionName "My Subscription" -Region westeurope
-
-    Example output:
-
-        Region:  uksouth
-        VM Type:  Standard_D8s_v3
-        Latency (qperf tcp_lat - one-way latency, i.e. ~half the round-trip, in us):
-                 ----------------------------------------------
-                 |    zone 1    |    zone 2    |    zone 3    |
-        -------------------------------------------------------
-        | zone 1 |              |       xxx us |       xxx us |
-        | zone 2 |       xxx us |              |       xxx us |
-        | zone 3 |       xxx us |       xxx us |              |
-        -------------------------------------------------------
-
-        Bandwidth (qperf tcp_bw, in MB/sec):
-                 ----------------------------------------------
-                 |    zone 1    |    zone 2    |    zone 3    |
-        -------------------------------------------------------
-        | zone 1 |              |   xxx MB/sec |   xxx MB/sec |
-        | zone 2 |   xxx MB/sec |              |   xxx MB/sec |
-        | zone 3 |   xxx MB/sec |   xxx MB/sec |              |
-        -------------------------------------------------------
-
-        sockperf idle one-way latency in us (one-way = ~half round-trip; comparable to the qperf latency table above):
-
-        From   To     OWAvg(us) OWP90(us) OWP99(us) OWMax(us)
-        ----   --     --------- --------- --------- ---------
-        zone 1 zone 2       xxx       xxx       xxx       xxx
-        zone 1 zone 3       xxx       xxx       xxx       xxx
-        zone 2 zone 3       xxx       xxx       xxx       xxx
-        zone 2 zone 1       xxx       xxx       xxx       xxx
-        zone 3 zone 1       xxx       xxx       xxx       xxx
-        zone 3 zone 2       xxx       xxx       xxx       xxx
-
-        sockperf idle full round-trip time (RTT) in us (--full-rtt pass):
-
-        From   To     RTTAvg(us) RTTP90(us) RTTP99(us) RTTMax(us)
-        ----   --     ---------- ---------- ---------- ----------
-        zone 1 zone 2        xxx        xxx        xxx        xxx
-        zone 1 zone 3        xxx        xxx        xxx        xxx
-        zone 2 zone 3        xxx        xxx        xxx        xxx
-        zone 2 zone 1        xxx        xxx        xxx        xxx
-        zone 3 zone 1        xxx        xxx        xxx        xxx
-        zone 3 zone 2        xxx        xxx        xxx        xxx
-
-        RTT under load in us - bufferbloat (idle RTT avg vs RTT during an iperf3 TCP transfer):
-
-        From   To     RTTAvg(us) LoadRTTavg(us) LoadRTTp99(us)
-        ----   --     ---------- -------------- --------------
-        zone 1 zone 2        xxx            xxx            xxx
-        zone 1 zone 3        xxx            xxx            xxx
-        zone 2 zone 3        xxx            xxx            xxx
-        zone 2 zone 1        xxx            xxx            xxx
-        zone 3 zone 1        xxx            xxx            xxx
-        zone 3 zone 2        xxx            xxx            xxx
-
-        iperf3 TCP throughput in MB/sec - single flow (avg/P90/P99/max), retransmits, and aggregate over N streams:
-
-        From   To     TCP1avg(MB/s) TCP1p90(MB/s) TCP1p99(MB/s) TCP1max(MB/s) Retr TCPagg(MB/s)
-        ----   --     ------------- ------------- ------------- ------------- ---- ------------
-        zone 1 zone 2           xxx           xxx           xxx           xxx    x          xxx
-        zone 1 zone 3           xxx           xxx           xxx           xxx    x          xxx
-        zone 2 zone 3           xxx           xxx           xxx           xxx    x          xxx
-        zone 2 zone 1           xxx           xxx           xxx           xxx    x          xxx
-        zone 3 zone 1           xxx           xxx           xxx           xxx    x          xxx
-        zone 3 zone 2           xxx           xxx           xxx           xxx    x          xxx
-
-        iperf3 UDP packet loss %/jitter (ms) - baseline (100 Mbps, organic) vs saturation (~TCP rate, load-induced):
-
-        From   To     UDPbLoss(%) UDPbJit(ms) UDPsAvg(MB/s) UDPsLoss(%) UDPsJit(ms)
-        ----   --     ----------- ----------- ------------- ----------- -----------
-        zone 1 zone 2        0.00         xxx           xxx        xxxx         xxx
-        zone 1 zone 3        0.00         xxx           xxx        xxxx         xxx
-        zone 2 zone 3        0.00         xxx           xxx        xxxx         xxx
-        zone 2 zone 1        0.00         xxx           xxx        xxxx         xxx
-        zone 3 zone 1        0.00         xxx           xxx        xxxx         xxx
-        zone 3 zone 2        0.00         xxx           xxx        xxxx         xxx
+    ./AvZone-Latency-Test-NoAzure.ps1 -Zone1 20.1.1.10 -Zone2 20.1.1.11 -Zone3 20.1.1.12 `
+        -Zone1TestIp 10.0.0.4 -Zone2TestIp 10.0.0.5 -Zone3TestIp 10.0.0.6 `
+        -VMLocalAdminUser azping -VMLocalAdminPassword 'P@ssw0rd!'
 
 .LINK
     https://github.com/Azure/SAP-on-Azure-Scripts-and-Utilities
 
 .NOTES
-    v0.1        - Initial version
-    v0.2        - adding usage of existing VNET
-    v0.3        - switching from variables to parameters
-                - adding documentation
-                - adding logon check
-    2022041101  - using IP address instead of hostname to avoid issues in existing VNETs
-                - creating storage account for diagnostic information
-    2023030601  - changing how existing sessions are deleted
-                - switching to CentOS 8.5
-                - adding TCP port check
-                - fixing issue with "breaking change" warnings
-                - changing how the physical hostname is retrieved from .kvp_pool_3 file
-    2026092801  - switching to Ubuntu 26.04 LTS (Canonical image)
-                - installing qperf via apt-get instead of yum
-                - waiting for cloud-init to finish and using non-interactive apt
-    2026092802  - adding sockperf (RTT percentiles + packet loss) and iperf3 (throughput)
-                  to report Average/P95/P99/Max RTT, Packet Loss %, and Avg. Throughput
-    2026092803  - sockperf now runs two passes (one-way latency and full round-trip RTT),
-                  percentiles switched to P90/P99 (sockperf has no P95), iperf3 throughput
-                  reported in MB/sec, and qperf tables relabelled (one-way latency / MB/sec)
-    2026092804  - iperf3 now runs two passes (TCP and UDP) reporting throughput avg/P90/P99/max
-                  in MB/sec (from 0.1s interval samples), TCP retransmits, and UDP packet loss %
-                  and jitter; UDP pass targets the measured TCP rate; sockperf loss kept separately
-    2026092805  - TCP now drops slow-start warm-up (-O 1); added TCP aggregate throughput over
-                  one stream per vCPU (-P nproc); UDP loss split into baseline (100 Mbps) vs
-                  saturation; added RTT-under-load (bufferbloat) pass; removed near-zero sockperf
-                  ping-pong loss column
-    2026092806  - switching boot diagnostics to the Microsoft-managed storage account
-                  (no custom diagnostics storage account is created any more)
+    v1.0        - Standalone test-only fork of AvZone-Latency-Test.ps1:
+                  removed all Azure deployment, Az module requirements, and Azure login.
+                  Connects to three pre-created VMs, installs tools, and runs the tests.
 
 #>
 <#
@@ -135,60 +83,35 @@ Licensed under the MIT license.
 #>
 
 #Requires -Version 7.1
-#Requires -Modules Az.Compute
 #Requires -Modules @{ ModuleName="Posh-SSH"; ModuleVersion="3.0.0" }
 
 param(
-    #Azure Subscription Name
-    [Parameter(Mandatory=$true)][string]$SubscriptionName,
-    #Azure Region, use Get-AzLocation to get region names
-    [string]$region = "westeurope", 
-    #Resource Group Name that will be created
-    [string]$ResourceGroupName = "AvZoneLatencyTest", 
-    #Delete the test environment after test
-    [boolean]$DestroyAfterTest = $true, 
-    #Use an existing VNET, direct SSH connection to VMs required
-    [boolean]$UseExistingVnet = $false, 
-    #use existing VMs of a previous test
-    [boolean]$UseExistingVMs = $false, 
-    #use public IP addresses to connect
-    [boolean]$UsePublicIPAddresses = $true, 
-    # VM type, recommended Standard_D8s_v3
-    [string]$VMSize = "Standard_D8s_v3", 
-    #OS provider, for Ubuntu it is Canonical
-    [string]$OSPublisher = "Canonical", 
-    #OS Type
-    [string]$OSOffer = "ubuntu-26_04-lts", 
-    #OS Verion
-    [string]$OSSku = "server", 
-    #Latest OS image
-    [string]$OSVersion = "latest", 
-    #OS username
-    [string]$VMLocalAdminUser = "azping", 
-    #OS password
-    [string]$VMLocalAdminPassword = "P@ssw0rd!", 
-    #VM name prefix, 1,2,3 will be added based on zone
-    [string]$VMPrefix = "azping-vm0", 
-    #VM nic name
-    [string]$NICPostfix = "-nic1", 
-    #Public IP address postfix
-    [string]$pippostfix = "-pip", 
-    #Azure Network Security Group (NSG) name
-    [string]$NSGName = "azping-nsg", 
-    #Azure VNET name, if using existing VNET
-    [string]$NetworkName = "azping-mgmt-vnet",
-    #Azure Subnet name, if using exising
-    [string]$SubnetName = "default", 
-    #Resource Group Name of existing VNET
-    [string]$ResourceGroupNameNetwork = "azping-mgmt", 
-    #Azure IP Subnet prefix if using public IP to VNET creation
-    [string]$SubnetAddressPrefix = "10.1.1.0/24", 
-    #Azure IP VNET prefix if using public IP to VNET creation
-    [string]$VnetAddressPrefix = "10.1.1.0/24",
-    #decide to use qperf or niping
+    # IP address or host name used to SSH into the zone 1 VM
+    [Parameter(Mandatory=$true)][string]$Zone1,
+    # IP address or host name used to SSH into the zone 2 VM
+    [Parameter(Mandatory=$true)][string]$Zone2,
+    # IP address or host name used to SSH into the zone 3 VM
+    [Parameter(Mandatory=$true)][string]$Zone3,
+    # Optional address the other VMs use to reach zone 1 for the tests (defaults to $Zone1)
+    [string]$Zone1TestIp,
+    # Optional address the other VMs use to reach zone 2 for the tests (defaults to $Zone2)
+    [string]$Zone2TestIp,
+    # Optional address the other VMs use to reach zone 3 for the tests (defaults to $Zone3)
+    [string]$Zone3TestIp,
+    # SSH username (same on all three VMs)
+    [string]$VMLocalAdminUser = "azping",
+    # SSH password (same on all three VMs); ignored when -SSHKeyFilePath is used
+    [string]$VMLocalAdminPassword = "P@ssw0rd!",
+    # Optional private key file for key-based SSH authentication
+    [string]$SSHKeyFilePath,
+    # decide to use qperf or niping
     [ValidateSet("qperf","niping")][string]$testtool = "qperf",
-    #path to niping
-    [string]$nipingpath
+    # path to niping
+    [string]$nipingpath,
+    # informational label for the report header only
+    [string]$Region = "(not specified)",
+    # informational label for the report header only
+    [string]$VMSize = "(not specified)"
 )
 
 
@@ -324,36 +247,26 @@ Function Get-AdvancedNetworkStats {
     }
 }
 
-    $breakingchangewarning = Get-AzConfig -DisplayBreakingChangeWarning
-    if ($breakingchangewarning.Value -eq $true) {
-        Update-AzConfig -DisplayBreakingChangeWarning $false
-    }
 
     if ($testtool -eq "niping") {
         if (!$nipingpath) {
             $nipingpath = Read-Host -Prompt "Please enter download path for niping executable: "
         }
-           
     }
-
-
-	# select subscription
-	$Subscription = Get-AzSubscription -SubscriptionName $SubscriptionName
-    if (-Not $Subscription) {
-        Write-Host -ForegroundColor Red -BackgroundColor White "Sorry, it seems you are not connected to Azure or don't have access to the subscription. Please use Connect-AzAccount to connect."
-        exit
-    }
-
-
-    Select-AzSubscription -Subscription $SubscriptionName -Force
 
     $VMLocalAdminSecurePassword = ConvertTo-SecureString $VMLocalAdminPassword -AsPlainText -Force
 
     $zones = 3
 
-    
-    #create the secure credential object
-	$Credential = New-Object System.Management.Automation.PSCredential ($VMLocalAdminUser, $VMLocalAdminSecurePassword);
+    # create the secure credential object
+    $Credential = New-Object System.Management.Automation.PSCredential ($VMLocalAdminUser, $VMLocalAdminSecurePassword)
+
+    # connection endpoints (used for SSH) and test targets (used by the VMs to reach each other)
+    $connectips = @($Zone1, $Zone2, $Zone3)
+    $test1 = if ($Zone1TestIp) { $Zone1TestIp } else { $Zone1 }
+    $test2 = if ($Zone2TestIp) { $Zone2TestIp } else { $Zone2 }
+    $test3 = if ($Zone3TestIp) { $Zone3TestIp } else { $Zone3 }
+    $testips = @($test1, $test2, $test3)
 
     # initialize the arrays for outputs
     $latency = @(("","",""),("","",""),("","",""))
@@ -366,71 +279,6 @@ Function Get-AdvancedNetworkStats {
         }
     }
 
-    
-
-    if ($UseExistingVMs) {
-        Write-Host "Using existing VMs" -ForegroundColor Green
-    }
-    else {
-
-        # create resource group
-        Write-Host -ForegroundColor Green "Creating resource group"
-        $ResourceGroup = New-AzResourceGroup -Location $region -Name $ResourceGroupName
-
-        # create vNET and Subnet or getting existing
-	    if ($UseExistingVnet) {
-            Write-Host -ForegroundColor Green "Getting existing vNET and Subnet Config"
-            $Vnet = Get-AzVirtualNetwork -Name $NetworkName -ResourceGroupName $ResourceGroupNameNetwork
-            $SingleSubnet = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $Vnet -Name $SubnetName
-        }
-        else {
-            Write-Host -ForegroundColor Green "Creating vNET and Subnet"
-            $SingleSubnet = New-AzVirtualNetworkSubnetConfig -Name $SubnetName -AddressPrefix $SubnetAddressPrefix
-            $Vnet = New-AzVirtualNetwork -Name $NetworkName -ResourceGroupName $ResourceGroupName -Location $region -AddressPrefix $VnetAddressPrefix -Subnet $SingleSubnet
-        }
-
-        # create NSG
-        Write-Host -ForegroundColor Green "Creating NSG"
-        $rule1 = New-AzNetworkSecurityRuleConfig -Name ssh-rule -Description "Allow SSH" -Access Allow -Direction Inbound -Protocol Tcp -Priority 100 -SourcePortRange * -SourceAddressPrefix * -DestinationAddressPrefix * -DestinationPortRange 22
-        $nsg = New-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -Location $region -Name $NSGName -SecurityRules $rule1
-
-    
-        # create VMs
-        Write-Host -ForegroundColor Green "Creating VMs"
-        For ($zone=1; $zone -le $zones; $zone++) {
-
-            $ComputerName = $VMPrefix + $zone
-            $NICName = $ComputerName + $NICPostfix
-       	    $PIPName = $NICName + $pippostfix
-	        $Subnet = Get-AzVirtualNetworkSubnetConfig -Name $SubnetName -VirtualNetwork $Vnet
-    	    if ($UsePublicIPAddresses) {
-                $PIP = New-AzPublicIpAddress -Name $PIPName -ResourceGroupName $ResourceGroupName -Location $region -Sku Standard -AllocationMethod Static -IpAddressVersion IPv4 -Zone $zone
-	            $IPConfig1 = New-AzNetworkInterfaceIpConfig -Name "IPConfig-1" -Subnet $Subnet -PublicIpAddress $PIP -Primary
-            }
-            else {
-                $IPConfig1 = New-AzNetworkInterfaceIpConfig -Name "IPConfig-1" -Subnet $Subnet -Primary
-            }
-    	    $NIC = New-AzNetworkInterface -Name $NicName -ResourceGroupName $ResourceGroupName -Location $region -IpConfiguration $IpConfig1 -EnableAcceleratedNetworking -NetworkSecurityGroup $nsg
-	        $VirtualMachine = New-AzVMConfig -VMName $ComputerName -VMSize $VMSize
-            $VirtualMachine = Set-AzVMOperatingSystem -VM $VirtualMachine -Linux -ComputerName $ComputerName -Credential $Credential -DisablePasswordAuthentication:$false
-            $VirtualMachine = Add-AzVMNetworkInterface -VM $VirtualMachine -Id $NIC.Id
-            $VirtualMachine = Set-AzVMSourceImage -VM $VirtualMachine -PublisherName $OSPublisher -Offer $OSOffer -Skus $OSSku -Version $OSVersion
-            $VirtualMachine = Set-AzVMBootDiagnostic -VM $VirtualMachine -Enable
-            $vm = New-AzVM -ResourceGroupName $ResourceGroupName -Location $region -VM $VirtualMachine -zone $zone -Verbose -AsJob
-                
-        }
-
-	    # waiting for VM creation jobs to finish
-        "All jobs created, waiting ..."
-        Get-Job | Wait-Job
-	    "All jobs completed"
-	    Get-AzVM -ResourceGroupName $ResourceGroupName
-
-        # adding some time as it sometimes helps :-)
-        "Waiting for four minute for all systems to come up ..."
-        Start-Sleep -Seconds 240
-    }
-
 
     # removing all open ssh sessions
     Get-SSHTrustedHost | Remove-SSHTrustedHost
@@ -439,63 +287,39 @@ Function Get-AdvancedNetworkStats {
         Remove-SSHSession -SessionId $sshsession.SessionId
     }
 
-    # creating SSH sessions to VMs
-    $ipaddresses = @{}
-
+    # creating SSH sessions to the pre-existing VMs
     Write-Host -ForegroundColor Green "Creating SSH sessions"
     For ($zone=1; $zone -le $zones; $zone++) {
-        $ComputerName = $VMPrefix + $zone
-        $pipname = $VMPrefix + $zone + $NICPostfix + $pippostfix 
-        $NICName = $ComputerName + $NICPostfix
-
-        if ($UsePublicIPAddresses) {
-			$nic = Get-AzNetworkInterface -Name $NICName
-			$networkinterfaceconfig = Get-AzNetworkInterfaceIpConfig -NetworkInterface $nic
-            $ipaddresses[$ComputerName] += $networkinterfaceconfig.PrivateIpAddress
-
-            $pipname = $VMPrefix + $zone + $NICPostfix + $pippostfix 
-			$PIP = Get-AzPublicIpAddress -Name $pipname
-			$ipaddress = $PIP.IpAddress
-        }
-        else {
-			$nic = Get-AzNetworkInterface -Name $NICName
-			$networkinterfaceconfig = Get-AzNetworkInterfaceIpConfig -NetworkInterface $nic
-            $ipaddress = $networkinterfaceconfig.PrivateIpAddress
-            $ipaddresses[$ComputerName] += $networkinterfaceconfig.PrivateIpAddress
-        }
+        $ipaddress = $connectips[$zone-1]
         try {
             # checking TCP connectivity
             $_testresult = New-Object System.Net.Sockets.TcpClient($ipaddress, 22)
             if ($_testresult.Connected) {
                 # connected
-                Write-Host -ForegroundColor Green "TCP connection available to VM $ComputerName with IP address $ipaddress"
-                $sshsession = New-SSHSession -ComputerName $ipaddress -Credential $Credential -AcceptKey -Force
+                Write-Host -ForegroundColor Green "TCP connection available to zone $zone VM with address $ipaddress"
+                if ($SSHKeyFilePath) {
+                    $sshsession = New-SSHSession -ComputerName $ipaddress -Credential $Credential -KeyFile $SSHKeyFilePath -AcceptKey -Force
+                }
+                else {
+                    $sshsession = New-SSHSession -ComputerName $ipaddress -Credential $Credential -AcceptKey -Force
+                }
                 if ($sshsession.connected -ne $true)
                 {
-                    Write-Host "Unable to connect to IP address $ipaddress"
+                    Write-Host "Unable to connect to address $ipaddress"
                     exit
                 }
             }
             else {
-                Write-Host -ForegroundColor Red "unable to connect to SSH port for VM $ipaddress. Please check if you can connect to the VM from your host using e.g. putty"
+                Write-Host -ForegroundColor Red "unable to connect to SSH port for zone $zone VM $ipaddress. Please check if you can connect to the VM from your host using e.g. putty"
             }
         }
         catch {
+            Write-Host -ForegroundColor Red "Failed to connect to zone $zone VM $ipaddress : $($_.Exception.Message)"
             exit
         }
     }
 
     $sshsessions = Get-SSHSession
-
-
-    Write-Host -ForegroundColor Green "Getting Hosts for virtual machines"
-    For ($zone=1; $zone -le $zones; $zone++) {
-
-        #$output = Invoke-SSHCommand -Command "/bin/cat /var/lib/hyperv/.kvp_pool_3 | tr -d '\\000' | grep -o -P '(?<=HostName).*(?=CLOUD_INIT)'" -SessionId $sshsessions[$zone-1].SessionId
-        $output = Invoke-SSHCommand -Command "strings /var/lib/hyperv/.kvp_pool_3 | sed -n '2 p'" -SessionId $sshsessions[$zone-1].SessionId
-        Write-Host ("VM$zone : " + $output.Output) 
-
-    }
 
 
     # run qperf test
@@ -516,11 +340,11 @@ Function Get-AdvancedNetworkStats {
             $check = Invoke-SSHCommand -Command "for t in qperf sockperf iperf3; do command -v `$t >/dev/null 2>&1 && echo `$t=ok || echo `$t=MISSING; done" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 30
             $checktext = $check.Output -join "`n"
             if ($checktext -match 'MISSING') {
-                Write-Host -ForegroundColor Red "VM$zone : one or more tools failed to install -> $($check.Output -join ' ')"
-                Write-Host -ForegroundColor Yellow ("VM$zone apt output (tail): " + (($installlog -split "`n" | Select-Object -Last 8) -join "`n"))
+                Write-Host -ForegroundColor Red "zone $zone : one or more tools failed to install -> $($check.Output -join ' ')"
+                Write-Host -ForegroundColor Yellow ("zone $zone apt output (tail): " + (($installlog -split "`n" | Select-Object -Last 8) -join "`n"))
             }
             else {
-                Write-Host -ForegroundColor Green "VM$zone : qperf, sockperf and iperf3 installed"
+                Write-Host -ForegroundColor Green "zone $zone : qperf, sockperf and iperf3 installed"
             }
 
             # start the measurement servers
@@ -535,11 +359,9 @@ Function Get-AdvancedNetworkStats {
         For ($zone=1; $zone -le $zones; $zone++) {
 
             $vmtopingno1 = (( $zone   %3)+1)
-            $vmtoping1 = $VMPrefix + (( $zone   %3)+1)
-            $ipaddresstoping1 = $ipaddresses[$vmtoping1]
+            $ipaddresstoping1 = $testips[$vmtopingno1-1]
             $vmtopingno2 = ((($zone+1)%3)+1)
-            $vmtoping2 = $VMPrefix + ((($zone+1)%3)+1)
-            $ipaddresstoping2 = $ipaddresses[$vmtoping2]
+            $ipaddresstoping2 = $testips[$vmtopingno2-1]
 
             $output = Invoke-SSHCommand -Command "qperf $ipaddresstoping1 tcp_lat" -SessionId $sshsessions[$zone-1].SessionId
             $latencytemp = [string]$output.Output[1]
@@ -582,11 +404,9 @@ Function Get-AdvancedNetworkStats {
         For ($zone=1; $zone -le $zones; $zone++) {
 
             $vmtopingno1 = (( $zone   %3)+1)
-            $vmtoping1 = $VMPrefix + $vmtopingno1
-            $ipaddresstoping1 = $ipaddresses[$vmtoping1]
+            $ipaddresstoping1 = $testips[$vmtopingno1-1]
             $vmtopingno2 = ((($zone+1)%3)+1)
-            $vmtoping2 = $VMPrefix + $vmtopingno2
-            $ipaddresstoping2 = $ipaddresses[$vmtoping2]
+            $ipaddresstoping2 = $testips[$vmtopingno2-1]
 
             $advresults += Get-AdvancedNetworkStats -SessionId $sshsessions[$zone-1].SessionId -TargetIp $ipaddresstoping1 -FromLabel "zone $zone" -ToLabel "zone $vmtopingno1" -Cores $cores
             $advresults += Get-AdvancedNetworkStats -SessionId $sshsessions[$zone-1].SessionId -TargetIp $ipaddresstoping2 -FromLabel "zone $zone" -ToLabel "zone $vmtopingno2" -Cores $cores
@@ -611,11 +431,9 @@ Function Get-AdvancedNetworkStats {
         For ($zone=1; $zone -le $zones; $zone++) {
 
             $vmtopingno1 = (( $zone   %3)+1)
-            $vmtoping1 = $VMPrefix + (( $zone   %3)+1)
-            $ipaddresstoping1 = $ipaddresses[$vmtoping1]
+            $ipaddresstoping1 = $testips[$vmtopingno1-1]
             $vmtopingno2 = ((($zone+1)%3)+1)
-            $vmtoping2 = $VMPrefix + ((($zone+1)%3)+1)
-            $ipaddresstoping2 = $ipaddresses[$vmtoping2]
+            $ipaddresstoping2 = $testips[$vmtopingno2-1]
 
             $output = Invoke-SSHCommand -Command "/tmp/niping -c -B 10 -L 100 -H $ipaddresstoping1 | grep av2" -SessionId $sshsessions[$zone-1].SessionId
             $latencytemp = [string]$output.Output
@@ -653,9 +471,9 @@ Function Get-AdvancedNetworkStats {
 
         }
     }
-    
+
     # Print output
-    Write-Host "Region: " $region
+    Write-Host "Region: " $Region
     Write-Host "VM Type: " $VMSize
 
     Write-Host "Latency (qperf tcp_lat - one-way latency, i.e. ~half the round-trip, in us):"
@@ -700,23 +518,7 @@ Function Get-AdvancedNetworkStats {
 
     # Removing SSH sessions
     Write-Host -ForegroundColor Green "Removing SSH Sessions"
-    #Get-SSHSession | Remove-SSHSession -ErrorAction SilentlyContinue | Out-Null
     $sshsessions = Get-SSHSession
     foreach ($sshsession in $sshsessions) {
         Remove-SSHSession -SessionId $sshsession.SessionId
-    }
-    
-    
-    #destroy resource group
-    if ($DestroyAfterTest) {
-        Write-Host -ForegroundColor Green "Deleting Resource Group"
-        Remove-AzResourceGroup -Name $ResourceGroupName -Force
-    }
-    else
-    {
-        Write-Host -ForegroundColor Green "Resource group will NOT be deleted"
-    }
-
-    if ($breakingchangewarning.Value -eq $true) {
-        Update-AzConfig -DisplayBreakingChangeWarning $true
     }
