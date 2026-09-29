@@ -82,6 +82,9 @@
     v0.1 - Initial version
     v0.2 - Update required module specification to use Az.Compute 4.2.1 which allows location parameter
             for better filtering of results
+    v0.3 - Account for per-subscription SKU restrictions (Restrictions of Type Zone/Location) so the
+            reported zones match what the subscription can actually deploy, not just the region's
+            general zone support (LocationInfo.Zones).
 #>
 
 <#
@@ -126,7 +129,20 @@ foreach ($vm in $vms) {
         $zone3 = ""
         $outputtemp = New-Object -TypeName PSObject
 
-        foreach ($zone in $vm.locationinfo.zones) {
+        # LocationInfo.Zones lists the zones the SKU exists in for the region in general.
+        # Restrictions (Type=Zone/Location, ReasonCode=NotAvailableForSubscription or QuotaId)
+        # narrow that down for THIS subscription - the portal reflects the restricted set.
+        $locationRestricted = @($vm.Restrictions | Where-Object { $_.Type -eq 'Location' }).Count -gt 0
+
+        $restrictedZones = @()
+        foreach ($restriction in ($vm.Restrictions | Where-Object { $_.Type -eq 'Zone' })) {
+            $restrictedZones += $restriction.RestrictionInfo.Zones
+        }
+
+        $effectiveZones = if ($locationRestricted) { @() }
+                          else { $vm.locationinfo.zones | Where-Object { $_ -notin $restrictedZones } }
+
+        foreach ($zone in $effectiveZones) {
 
             switch ($zone) {
                 1 { $zone1 = "X" }

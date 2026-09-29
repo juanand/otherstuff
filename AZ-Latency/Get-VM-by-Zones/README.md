@@ -1,5 +1,38 @@
 # Get VMs available in zones
 
+## Fix: per-subscription zone restrictions (v0.3)
+
+Earlier versions of the script read only `LocationInfo.Zones` from `Get-AzComputeResourceSku`.
+That property lists the zones a SKU exists in **for the region in general** — it does **not**
+reflect **per-subscription restrictions**. As a result the script could show a size as available
+in zones 1, 2 and 3 even though your subscription can only deploy it in zone 1 (the portal would
+say *"This size is not available in zone X. Zones '1' are supported"*).
+
+The accurate per-subscription availability lives in the SKU's separate `Restrictions` property.
+A SKU can list `LocationInfo.Zones = 1,2,3` while also carrying a restriction like:
+
+* `Type = Zone`, `RestrictionInfo.Zones = 2,3`, `ReasonCode = NotAvailableForSubscription`
+
+which means only zone 1 is actually usable for that subscription.
+
+The script now computes the **effective** zones = `LocationInfo.Zones` **minus** any zones listed
+in `Restrictions` of `Type = Zone`, and treats a `Type = Location` restriction as "not available at
+all in this region for this subscription". The output now matches what the portal allows.
+
+> **Caveat:** `Restrictions` covers the `NotAvailableForSubscription` / quota cases (what most
+> people hit). It does **not** predict transient capacity/allocation failures where a zone has the
+> SKU enabled but is temporarily out of capacity at deploy time — no SKU-listing API does. To
+> inspect the raw restrictions for a single size:
+>
+> ```powershell
+> Get-AzComputeResourceSku -Location westeurope |
+>     Where-Object { $_.Name -eq 'Standard_D8ads_v5' } |
+>     Select-Object -ExpandProperty Restrictions |
+>     Format-List Type, ReasonCode,
+>         @{n='Zones';e={$_.RestrictionInfo.Zones -join ','}},
+>         @{n='Locations';e={$_.RestrictionInfo.Locations -join ','}}
+> ```
+
 ## Availability Zones
 
 [Availability Zones](https://docs.microsoft.com/en-us/azure/availability-zones/az-overview) provide different datacenter with independent cooling, power and network within one Azure Region.
