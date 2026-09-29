@@ -10,6 +10,7 @@ import json
 import sys
 import paramiko
 
+from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
@@ -243,9 +244,17 @@ def get_private_ip_address(network_client, resource_group_name, vm_name):
         vm_name (str): The name of the virtual machine.
 
     Returns:
-        str: The private IP address of the virtual machine.
+        str: The private IP address of the virtual machine, or None if the NIC does not exist.
     """
-    nic = network_client.network_interfaces.get(resource_group_name, f"{vm_name}-nic")
+    try:
+        nic = network_client.network_interfaces.get(resource_group_name, f"{vm_name}-nic")
+    except ResourceNotFoundError:
+        logging.error(
+            "NIC '%s-nic' not found in resource group '%s'. The VMs have not been created yet. "
+            "Run the script without --run/--show-info first to create the infrastructure.",
+            vm_name, resource_group_name,
+        )
+        return None
     return nic.ip_configurations[0].private_ip_address
 
 def create_ssh_client(ip_address, username, password, skip_setup=False):

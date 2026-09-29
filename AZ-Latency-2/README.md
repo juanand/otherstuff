@@ -8,6 +8,8 @@
 > - **Tightened NSG:** All inbound rules (SSH, iperf3, sockperf, two-ping, asn, icmp) now allow traffic only from the `VirtualNetwork` service tag instead of `*`.
 > - **Managed boot diagnostics:** VMs enable boot diagnostics with a **Microsoft-managed** storage account (no `storage_uri`), enabling Serial Console without provisioning a customer storage account.
 > - **No storage accounts:** The tool does not create or use any Azure Storage account; the only VM `storage_profile` is the OS-disk image reference.
+> - **Build dependencies for `cffi`:** `install.sh` now installs the system prerequisites needed when `cffi` (a `cryptography`/`PyNaCl` dependency) has to be compiled from source — a C compiler (`build-essential`/`gcc`), `libffi` headers, and the matching Python development headers (`python<version>-dev`, falling back to `python3-dev`). This avoids the `fatal error: Python.h: No such file or directory` build failure, which happens on Python versions that lack prebuilt `cffi` wheels. Supports apt, dnf, and yum based distros.
+> - **Graceful missing-resource handling:** `get_private_ip_address` now catches `ResourceNotFoundError` and logs an actionable message (create the infrastructure first) instead of crashing with a stack trace when `--run`/`--show-info` is used before the VMs exist.
 
 # Azure Zone Latency/Bandwidth Test
 
