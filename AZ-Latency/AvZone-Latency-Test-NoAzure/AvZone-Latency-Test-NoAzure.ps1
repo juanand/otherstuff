@@ -58,10 +58,12 @@
     Download URL for the niping executable (only used when -testtool niping).
 
 .PARAMETER Region
-    Free-text label shown in the report header (informational only).
+    Free-text label shown in the report header. When omitted, it is auto-filled from the zone 1
+    VM's Azure IMDS data (read in-guest over SSH, no control plane needed).
 
 .PARAMETER VMSize
-    Free-text label shown in the report header (informational only).
+    Free-text label shown in the report header. When omitted, it is auto-filled from the zone 1
+    VM's Azure IMDS data (read in-guest over SSH, no control plane needed).
 
 .EXAMPLE
     ./AvZone-Latency-Test-NoAzure.ps1 -Zone1 20.1.1.10 -Zone2 20.1.1.11 -Zone3 20.1.1.12 `
@@ -75,6 +77,9 @@
     v1.0        - Standalone test-only fork of AvZone-Latency-Test.ps1:
                   removed all Azure deployment, Az module requirements, and Azure login.
                   Connects to three pre-created VMs, installs tools, and runs the tests.
+    v1.1        - Report each VM's KVP physical host name, and query Azure IMDS in-guest over SSH
+                  (location / vmSize / zone) to label the report and warn on zone mismatches.
+                  Both use only SSH - still no Azure control plane access or identity required.
 
 #>
 <#
@@ -322,14 +327,34 @@ Function Get-AdvancedNetworkStats {
     $sshsessions = Get-SSHSession
 
 
-    # get the Hyper-V KVP physical host name for each VM (SSH only, no Azure control plane)
+    # get the Hyper-V KVP physical host name and Azure IMDS facts for each VM.
+    # Both are read from inside the guest over SSH - IMDS is a link-local, unauthenticated
+    # endpoint (169.254.169.254), so no Azure control plane access or identity is required.
     Write-Host -ForegroundColor Green "Getting Hosts for virtual machines"
+    $imdsInfo = @{}
     For ($zone=1; $zone -le $zones; $zone++) {
 
         $output = Invoke-SSHCommand -Command "strings /var/lib/hyperv/.kvp_pool_3 | sed -n '2 p'" -SessionId $sshsessions[$zone-1].SessionId
-        Write-Host ("zone $zone : " + $output.Output)
+        Write-Host ("zone $zone host: " + $output.Output)
+
+        $imds = Invoke-SSHCommand -Command "curl -s -H 'Metadata:true' --max-time 5 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01&format=json'" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 20
+        try {
+            $meta = ($imds.Output -join "`n") | ConvertFrom-Json
+            $imdsInfo[$zone] = $meta
+            Write-Host ("zone $zone IMDS: location=$($meta.location) vmSize=$($meta.vmSize) zone=$($meta.zone)")
+            if ($meta.zone -and $meta.zone -ne "$zone") {
+                Write-Host -ForegroundColor Yellow "  note: zone $zone VM reports Azure zone '$($meta.zone)' (expected $zone)"
+            }
+        }
+        catch {
+            Write-Host -ForegroundColor Yellow "zone $zone IMDS: not available (VM may not be on Azure or IMDS is blocked)"
+        }
 
     }
+
+    # if -Region / -VMSize were not supplied, auto-fill the report header from zone 1's IMDS data
+    if ($Region -eq "(not specified)" -and $imdsInfo[1] -and $imdsInfo[1].location) { $Region = $imdsInfo[1].location }
+    if ($VMSize -eq "(not specified)" -and $imdsInfo[1] -and $imdsInfo[1].vmSize)  { $VMSize = $imdsInfo[1].vmSize }
 
 
     # run qperf test
@@ -510,19 +535,19 @@ Function Get-AdvancedNetworkStats {
     if ($advresults) {
         Write-Host ""
         Write-Host "sockperf idle one-way latency in us (one-way = ~half round-trip; comparable to the qperf latency table above):"
-        $advresults | Format-Table From, To, 'OWAvg(us)', 'OWP90(us)', 'OWP99(us)', 'OWMax(us)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'OWAvg(us)', 'OWP90(us)', 'OWP99(us)', 'OWMax(us)' -AutoSize | Out-String -Width 4096 | Write-Host
 
         Write-Host "sockperf idle full round-trip time (RTT) in us (--full-rtt pass):"
-        $advresults | Format-Table From, To, 'RTTAvg(us)', 'RTTP90(us)', 'RTTP99(us)', 'RTTMax(us)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'RTTAvg(us)', 'RTTP90(us)', 'RTTP99(us)', 'RTTMax(us)' -AutoSize | Out-String -Width 4096 | Write-Host
 
         Write-Host "RTT under load in us - bufferbloat (idle RTT avg vs RTT measured during an iperf3 TCP transfer):"
-        $advresults | Format-Table From, To, 'RTTAvg(us)', 'LoadRTTavg(us)', 'LoadRTTp99(us)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'RTTAvg(us)', 'LoadRTTavg(us)', 'LoadRTTp99(us)' -AutoSize | Out-String -Width 4096 | Write-Host
 
         Write-Host "iperf3 TCP throughput in MB/sec - single flow (avg/P90/P99/max, warm-up dropped), retransmits, and aggregate over $cores parallel streams:"
-        $advresults | Format-Table From, To, 'TCP1avg(MB/s)', 'TCP1p90(MB/s)', 'TCP1p99(MB/s)', 'TCP1max(MB/s)', 'Retr', 'TCPagg(MB/s)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'TCP1avg(MB/s)', 'TCP1p90(MB/s)', 'TCP1p99(MB/s)', 'TCP1max(MB/s)', 'Retr', 'TCPagg(MB/s)' -AutoSize | Out-String -Width 4096 | Write-Host
 
         Write-Host "iperf3 UDP packet loss %/jitter (ms) - baseline (100 Mbps, organic) vs saturation (~TCP rate, load-induced):"
-        $advresults | Format-Table From, To, 'UDPbLoss(%)', 'UDPbJit(ms)', 'UDPsAvg(MB/s)', 'UDPsLoss(%)', 'UDPsJit(ms)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'UDPbLoss(%)', 'UDPbJit(ms)', 'UDPsAvg(MB/s)', 'UDPsLoss(%)', 'UDPsJit(ms)' -AutoSize | Out-String -Width 4096 | Write-Host
     }
 
 

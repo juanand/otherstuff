@@ -682,19 +682,19 @@ Function Get-AdvancedNetworkStats {
     if ($advresults) {
         Write-Host ""
         Write-Host "sockperf idle one-way latency in us (one-way = ~half round-trip; comparable to the qperf latency table above):"
-        $advresults | Format-Table From, To, 'OWAvg(us)', 'OWP90(us)', 'OWP99(us)', 'OWMax(us)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'OWAvg(us)', 'OWP90(us)', 'OWP99(us)', 'OWMax(us)' -AutoSize | Out-String -Width 4096 | Write-Host
 
         Write-Host "sockperf idle full round-trip time (RTT) in us (--full-rtt pass):"
-        $advresults | Format-Table From, To, 'RTTAvg(us)', 'RTTP90(us)', 'RTTP99(us)', 'RTTMax(us)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'RTTAvg(us)', 'RTTP90(us)', 'RTTP99(us)', 'RTTMax(us)' -AutoSize | Out-String -Width 4096 | Write-Host
 
         Write-Host "RTT under load in us - bufferbloat (idle RTT avg vs RTT measured during an iperf3 TCP transfer):"
-        $advresults | Format-Table From, To, 'RTTAvg(us)', 'LoadRTTavg(us)', 'LoadRTTp99(us)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'RTTAvg(us)', 'LoadRTTavg(us)', 'LoadRTTp99(us)' -AutoSize | Out-String -Width 4096 | Write-Host
 
         Write-Host "iperf3 TCP throughput in MB/sec - single flow (avg/P90/P99/max, warm-up dropped), retransmits, and aggregate over $cores parallel streams:"
-        $advresults | Format-Table From, To, 'TCP1avg(MB/s)', 'TCP1p90(MB/s)', 'TCP1p99(MB/s)', 'TCP1max(MB/s)', 'Retr', 'TCPagg(MB/s)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'TCP1avg(MB/s)', 'TCP1p90(MB/s)', 'TCP1p99(MB/s)', 'TCP1max(MB/s)', 'Retr', 'TCPagg(MB/s)' -AutoSize | Out-String -Width 4096 | Write-Host
 
         Write-Host "iperf3 UDP packet loss %/jitter (ms) - baseline (100 Mbps, organic) vs saturation (~TCP rate, load-induced):"
-        $advresults | Format-Table From, To, 'UDPbLoss(%)', 'UDPbJit(ms)', 'UDPsAvg(MB/s)', 'UDPsLoss(%)', 'UDPsJit(ms)' -AutoSize | Out-Host
+        $advresults | Format-Table From, To, 'UDPbLoss(%)', 'UDPbJit(ms)', 'UDPsAvg(MB/s)', 'UDPsLoss(%)', 'UDPsJit(ms)' -AutoSize | Out-String -Width 4096 | Write-Host
     }
 
 
