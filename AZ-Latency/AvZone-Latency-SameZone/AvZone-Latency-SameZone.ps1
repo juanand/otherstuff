@@ -1,18 +1,25 @@
 <#
 
 .SYNOPSIS
-    Deploys VMs across Availability Zones and/or measures network latency and bandwidth between them.
+    Deploys two VMs in the SAME Availability Zone (optionally in one Proximity Placement Group)
+    and/or measures network latency and bandwidth between them.
 
 .DESCRIPTION
     This single script covers the full lifecycle through the -Mode parameter:
 
-        DeployAndTest (default) : deploy three VMs (one per Availability Zone), run the tests, and
+        DeployAndTest (default) : deploy two VMs into one Availability Zone, run the tests, and
                                   optionally delete everything afterwards.
-        DeployOnly              : deploy the three VMs only and leave them running. Prints the
+        DeployOnly              : deploy the two VMs only and leave them running. Prints the
                                   public/private IPs and a ready-to-run "-Mode TestOnly" command.
-        TestOnly                : run the tests against three VMs that already exist. No Azure
+        TestOnly                : run the tests against two VMs that already exist. No Azure
                                   deployment, no Az modules, and no Azure control-plane access or
                                   identity are required - you pass the VM addresses in.
+
+    Both VMs are pinned to the Availability Zone chosen with -Zone. With
+    -UseProximityPlacementGroup $true the script also creates a Proximity Placement Group and
+    deploys both VMs into it, so they are co-located as closely as the platform allows (same zone
+    AND same PPG). Running the deploy both ways - same zone with and without a PPG - lets you
+    quantify the latency benefit a PPG provides inside one zone.
 
     The TestOnly mode exists so the controller that drives the measurements does not need to talk
     to the Azure control plane. A typical split workflow is:
@@ -38,55 +45,58 @@
 
 .PARAMETER region
     The Azure region to deploy into (DeployAndTest / DeployOnly). In TestOnly it is only a report
-    header label and is auto-filled from the zone 1 VM's IMDS data when not supplied.
+    header label and is auto-filled from the first VM's IMDS data when not supplied.
 
-.PARAMETER Zone1
-    TestOnly: IP address or host name used to SSH into the VM in zone 1.
+.PARAMETER Zone
+    The Availability Zone (1, 2 or 3) both VMs are deployed into (deploy modes).
 
-.PARAMETER Zone2
-    TestOnly: IP address or host name used to SSH into the VM in zone 2.
+.PARAMETER UseProximityPlacementGroup
+    When $true, create a Proximity Placement Group and deploy both VMs into it (deploy modes).
 
-.PARAMETER Zone3
-    TestOnly: IP address or host name used to SSH into the VM in zone 3.
+.PARAMETER VM1
+    TestOnly: IP address or host name used to SSH into the first VM.
 
-.PARAMETER Zone1TestIp
-    TestOnly: optional address the other VMs use to reach zone 1 for the measurements (e.g. the
-    private IP). Defaults to -Zone1 when omitted.
+.PARAMETER VM2
+    TestOnly: IP address or host name used to SSH into the second VM.
 
-.PARAMETER Zone2TestIp
-    TestOnly: optional address the other VMs use to reach zone 2. Defaults to -Zone2 when omitted.
+.PARAMETER VM1TestIp
+    TestOnly: optional address VM2 uses to reach VM1 for the measurements (e.g. the private IP).
+    Defaults to -VM1 when omitted.
 
-.PARAMETER Zone3TestIp
-    TestOnly: optional address the other VMs use to reach zone 3. Defaults to -Zone3 when omitted.
+.PARAMETER VM2TestIp
+    TestOnly: optional address VM1 uses to reach VM2. Defaults to -VM2 when omitted.
 
 .PARAMETER SSHKeyFilePath
     Optional path to a private key file for key-based SSH authentication.
 
 .EXAMPLE
-    ./AvZone-Latency-Test.ps1 -SubscriptionName "My Subscription" -region westeurope
+    ./AvZone-Latency-SameZone.ps1 -SubscriptionName "My Subscription" -region westeurope -Zone 1
 
-    Deploys three zonal VMs, runs the tests, and tears them down (DeployAndTest).
-
-.EXAMPLE
-    ./AvZone-Latency-Test.ps1 -Mode DeployOnly -SubscriptionName "My Subscription" -region westeurope
-
-    Deploys the three VMs and leaves them running, printing a TestOnly command to use next.
+    Deploys two VMs in zone 1 (no PPG), measures between them, and tears them down.
 
 .EXAMPLE
-    ./AvZone-Latency-Test.ps1 -Mode TestOnly -Zone1 20.1.1.10 -Zone2 20.1.1.11 -Zone3 20.1.1.12 `
-        -Zone1TestIp 10.0.0.4 -Zone2TestIp 10.0.0.5 -Zone3TestIp 10.0.0.6 `
+    ./AvZone-Latency-SameZone.ps1 -SubscriptionName "My Subscription" -region westeurope -Zone 1 -UseProximityPlacementGroup $true
+
+    Deploys two VMs in zone 1 inside a single Proximity Placement Group and measures between them.
+
+.EXAMPLE
+    ./AvZone-Latency-SameZone.ps1 -Mode DeployOnly -SubscriptionName "My Subscription" -region westeurope -Zone 1
+
+    Deploys the two VMs and leaves them running, printing a TestOnly command to use next.
+
+.EXAMPLE
+    ./AvZone-Latency-SameZone.ps1 -Mode TestOnly -VM1 20.1.1.10 -VM2 20.1.1.11 `
+        -VM1TestIp 10.0.0.4 -VM2TestIp 10.0.0.5 `
         -VMLocalAdminUser azping -VMLocalAdminPassword 'P@ssw0rd!'
 
-    Runs the tests against three already-deployed VMs with no Azure access.
+    Runs the tests against two already-deployed VMs with no Azure access.
 
 .LINK
     https://github.com/Azure/SAP-on-Azure-Scripts-and-Utilities
 
 .NOTES
     Ubuntu 26.04 LTS, tools installed via apt (qperf / sockperf / iperf3), boot diagnostics on the
-    Microsoft-managed storage account. qperf reports one-way latency (tcp_lat) and bandwidth
-    (tcp_bw); sockperf reports idle one-way/full-RTT and RTT under load; iperf3 reports TCP
-    single-flow and aggregate throughput plus UDP loss/jitter.
+    Microsoft-managed storage account. Reports the vm 1 <-> vm 2 pair in both directions.
 
 #>
 <#
@@ -103,8 +113,12 @@ param(
     [string]$SubscriptionName,
     #Azure Region, use Get-AzLocation to get region names
     [string]$region = "westeurope",
+    #Availability Zone both VMs are deployed into
+    [ValidateSet("1","2","3")][string]$Zone = "1",
+    #Deploy both VMs into a single Proximity Placement Group
+    [boolean]$UseProximityPlacementGroup = $false,
     #Resource Group Name that will be created
-    [string]$ResourceGroupName = "AvZoneLatencyTest",
+    [string]$ResourceGroupName = "AvZoneLatencySameZone",
     #Delete the test environment after test (DeployAndTest only)
     [boolean]$DestroyAfterTest = $true,
     #Use an existing VNET, direct SSH connection to VMs required
@@ -127,8 +141,10 @@ param(
     [string]$VMLocalAdminUser = "azping",
     #OS password
     [string]$VMLocalAdminPassword = "P@ssw0rd!",
-    #VM name prefix, 1,2,3 will be added based on zone
+    #VM name prefix, 1,2 will be added based on VM index
     [string]$VMPrefix = "azping-vm0",
+    #Proximity Placement Group name
+    [string]$PPGName = "azping-ppg",
     #VM nic name
     [string]$NICPostfix = "-nic1",
     #Public IP address postfix
@@ -145,18 +161,14 @@ param(
     [string]$SubnetAddressPrefix = "10.1.1.0/24",
     #Azure IP VNET prefix if using public IP to VNET creation
     [string]$VnetAddressPrefix = "10.1.1.0/24",
-    #TestOnly: address used to SSH into the zone 1 VM
-    [string]$Zone1,
-    #TestOnly: address used to SSH into the zone 2 VM
-    [string]$Zone2,
-    #TestOnly: address used to SSH into the zone 3 VM
-    [string]$Zone3,
-    #TestOnly: address the other VMs use to reach zone 1 (defaults to $Zone1)
-    [string]$Zone1TestIp,
-    #TestOnly: address the other VMs use to reach zone 2 (defaults to $Zone2)
-    [string]$Zone2TestIp,
-    #TestOnly: address the other VMs use to reach zone 3 (defaults to $Zone3)
-    [string]$Zone3TestIp,
+    #TestOnly: address used to SSH into the first VM
+    [string]$VM1,
+    #TestOnly: address used to SSH into the second VM
+    [string]$VM2,
+    #TestOnly: address VM2 uses to reach VM1 (defaults to $VM1)
+    [string]$VM1TestIp,
+    #TestOnly: address VM1 uses to reach VM2 (defaults to $VM2)
+    [string]$VM2TestIp,
     #Optional private key file for key-based SSH authentication
     [string]$SSHKeyFilePath,
     #decide to use qperf or niping
@@ -319,20 +331,15 @@ Function Get-AdvancedNetworkStats {
         }
     }
 
-    $zones = 3
+    # two VMs in the same zone
+    $vmcount = 2
     $VMLocalAdminSecurePassword = ConvertTo-SecureString $VMLocalAdminPassword -AsPlainText -Force
     #create the secure credential object
     $Credential = New-Object System.Management.Automation.PSCredential ($VMLocalAdminUser, $VMLocalAdminSecurePassword);
 
-    # initialize the arrays for outputs
-    $latency = @(("","",""),("","",""),("","",""))
-    $bandwidth = @(("","",""),("","",""),("","",""))
-    for ($x=1; $x -le $zones; $x++) {
-        for ($y=1; $y -le 3; $y++) {
-            $latency[$x-1][$y-1] = "0"
-            $bandwidth[$x-1][$y-1] = "0"
-        }
-    }
+    # initialize the output arrays (index 0 = vm1->vm2, index 1 = vm2->vm1)
+    $latency = @("0","0")
+    $bandwidth = @("0","0")
 
     # connect to Azure for the modes that touch the control plane
     if ($needAzure) {
@@ -368,6 +375,13 @@ Function Get-AdvancedNetworkStats {
             Write-Host -ForegroundColor Green "Creating resource group"
             $ResourceGroup = New-AzResourceGroup -Location $region -Name $ResourceGroupName
 
+            # create a Proximity Placement Group when requested
+            $ppg = $null
+            if ($UseProximityPlacementGroup) {
+                Write-Host -ForegroundColor Green "Creating Proximity Placement Group"
+                $ppg = New-AzProximityPlacementGroup -ResourceGroupName $ResourceGroupName -Name $PPGName -Location $region -ProximityPlacementGroupType Standard
+            }
+
             # create vNET and Subnet or getting existing
             if ($UseExistingVnet) {
                 Write-Host -ForegroundColor Green "Getting existing vNET and Subnet Config"
@@ -386,28 +400,33 @@ Function Get-AdvancedNetworkStats {
             $nsg = New-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -Location $region -Name $NSGName -SecurityRules $rule1
 
 
-            # create VMs
-            Write-Host -ForegroundColor Green "Creating VMs"
-            For ($zone=1; $zone -le $zones; $zone++) {
+            # create VMs (both in the same zone, optionally in the same PPG)
+            Write-Host -ForegroundColor Green "Creating VMs in zone $Zone$(if ($UseProximityPlacementGroup) { ' (Proximity Placement Group enabled)' })"
+            For ($vmindex=1; $vmindex -le $vmcount; $vmindex++) {
 
-                $ComputerName = $VMPrefix + $zone
+                $ComputerName = $VMPrefix + $vmindex
                 $NICName = $ComputerName + $NICPostfix
                 $PIPName = $NICName + $pippostfix
                 $Subnet = Get-AzVirtualNetworkSubnetConfig -Name $SubnetName -VirtualNetwork $Vnet
                 if ($UsePublicIPAddresses) {
-                    $PIP = New-AzPublicIpAddress -Name $PIPName -ResourceGroupName $ResourceGroupName -Location $region -Sku Standard -AllocationMethod Static -IpAddressVersion IPv4 -Zone $zone
+                    $PIP = New-AzPublicIpAddress -Name $PIPName -ResourceGroupName $ResourceGroupName -Location $region -Sku Standard -AllocationMethod Static -IpAddressVersion IPv4 -Zone $Zone
                     $IPConfig1 = New-AzNetworkInterfaceIpConfig -Name "IPConfig-1" -Subnet $Subnet -PublicIpAddress $PIP -Primary
                 }
                 else {
                     $IPConfig1 = New-AzNetworkInterfaceIpConfig -Name "IPConfig-1" -Subnet $Subnet -Primary
                 }
                 $NIC = New-AzNetworkInterface -Name $NicName -ResourceGroupName $ResourceGroupName -Location $region -IpConfiguration $IpConfig1 -EnableAcceleratedNetworking -NetworkSecurityGroup $nsg
-                $VirtualMachine = New-AzVMConfig -VMName $ComputerName -VMSize $VMSize
+                if ($UseProximityPlacementGroup) {
+                    $VirtualMachine = New-AzVMConfig -VMName $ComputerName -VMSize $VMSize -ProximityPlacementGroupId $ppg.Id
+                }
+                else {
+                    $VirtualMachine = New-AzVMConfig -VMName $ComputerName -VMSize $VMSize
+                }
                 $VirtualMachine = Set-AzVMOperatingSystem -VM $VirtualMachine -Linux -ComputerName $ComputerName -Credential $Credential -DisablePasswordAuthentication:$false
                 $VirtualMachine = Add-AzVMNetworkInterface -VM $VirtualMachine -Id $NIC.Id
                 $VirtualMachine = Set-AzVMSourceImage -VM $VirtualMachine -PublisherName $OSPublisher -Offer $OSOffer -Skus $OSSku -Version $OSVersion
                 $VirtualMachine = Set-AzVMBootDiagnostic -VM $VirtualMachine -Enable
-                $vm = New-AzVM -ResourceGroupName $ResourceGroupName -Location $region -VM $VirtualMachine -zone $zone -Verbose -AsJob
+                $vm = New-AzVM -ResourceGroupName $ResourceGroupName -Location $region -VM $VirtualMachine -zone $Zone -Verbose -AsJob
 
             }
 
@@ -425,25 +444,23 @@ Function Get-AdvancedNetworkStats {
 
 
     # ---- build the connection + test address lists ----
-    # $connectips[zone-1]            : address used to SSH into each VM
-    # $ipaddresses[$VMPrefix+zone]   : address the VMs use to reach each other for the measurements
-    $connectips = @("","","")
-    $publicips  = @("","","")
+    # $connectips[index]             : address used to SSH into each VM
+    # $ipaddresses[$VMPrefix+index]  : address the VMs use to reach each other for the measurements
+    $connectips = @("","")
     $ipaddresses = @{}
 
     if ($Mode -eq "TestOnly") {
-        if (-not $Zone1 -or -not $Zone2 -or -not $Zone3) {
-            Write-Host -ForegroundColor Red "-Zone1, -Zone2 and -Zone3 are required for -Mode TestOnly."
+        if (-not $VM1 -or -not $VM2) {
+            Write-Host -ForegroundColor Red "-VM1 and -VM2 are required for -Mode TestOnly."
             exit
         }
-        $connectips = @($Zone1, $Zone2, $Zone3)
-        $ipaddresses[$VMPrefix + 1] = if ($Zone1TestIp) { $Zone1TestIp } else { $Zone1 }
-        $ipaddresses[$VMPrefix + 2] = if ($Zone2TestIp) { $Zone2TestIp } else { $Zone2 }
-        $ipaddresses[$VMPrefix + 3] = if ($Zone3TestIp) { $Zone3TestIp } else { $Zone3 }
+        $connectips = @($VM1, $VM2)
+        $ipaddresses[$VMPrefix + 1] = if ($VM1TestIp) { $VM1TestIp } else { $VM1 }
+        $ipaddresses[$VMPrefix + 2] = if ($VM2TestIp) { $VM2TestIp } else { $VM2 }
     }
     else {
-        For ($zone=1; $zone -le $zones; $zone++) {
-            $ComputerName = $VMPrefix + $zone
+        For ($vmindex=1; $vmindex -le $vmcount; $vmindex++) {
+            $ComputerName = $VMPrefix + $vmindex
             $NICName = $ComputerName + $NICPostfix
 
             $nic = Get-AzNetworkInterface -Name $NICName
@@ -453,11 +470,10 @@ Function Get-AdvancedNetworkStats {
             if ($UsePublicIPAddresses) {
                 $pipname = $ComputerName + $NICPostfix + $pippostfix
                 $PIP = Get-AzPublicIpAddress -Name $pipname
-                $publicips[$zone-1]  = $PIP.IpAddress
-                $connectips[$zone-1] = $PIP.IpAddress
+                $connectips[$vmindex-1] = $PIP.IpAddress
             }
             else {
-                $connectips[$zone-1] = $networkinterfaceconfig.PrivateIpAddress
+                $connectips[$vmindex-1] = $networkinterfaceconfig.PrivateIpAddress
             }
         }
     }
@@ -468,21 +484,23 @@ Function Get-AdvancedNetworkStats {
         Write-Host -ForegroundColor Green "Deployment complete. The VMs are left running."
         Write-Host ""
         Write-Host "Region:  $region"
+        Write-Host "Zone:    $Zone"
+        Write-Host "Proximity Placement Group:  $(if ($UseProximityPlacementGroup) { 'enabled' } else { 'disabled' })"
         Write-Host "VM Type: $VMSize"
         Write-Host ""
-        For ($zone=1; $zone -le $zones; $zone++) {
-            $ComputerName = $VMPrefix + $zone
-            Write-Host ("zone {0}  {1}  public={2}  private={3}" -f $zone, $ComputerName, $connectips[$zone-1], $ipaddresses[$ComputerName])
+        For ($vmindex=1; $vmindex -le $vmcount; $vmindex++) {
+            $ComputerName = $VMPrefix + $vmindex
+            Write-Host ("vm {0}  {1}  public={2}  private={3}" -f $vmindex, $ComputerName, $connectips[$vmindex-1], $ipaddresses[$ComputerName])
         }
         Write-Host ""
         Write-Host "Copy this script onto a controller that can reach the VMs over SSH and run the tests with:"
         if ($UsePublicIPAddresses) {
-            Write-Host ("  ./AvZone-Latency-Test.ps1 -Mode TestOnly -Zone1 {0} -Zone2 {1} -Zone3 {2} ``" -f $connectips[0], $connectips[1], $connectips[2])
-            Write-Host ("      -Zone1TestIp {0} -Zone2TestIp {1} -Zone3TestIp {2} ``" -f $ipaddresses[$VMPrefix+1], $ipaddresses[$VMPrefix+2], $ipaddresses[$VMPrefix+3])
+            Write-Host ("  ./AvZone-Latency-SameZone.ps1 -Mode TestOnly -VM1 {0} -VM2 {1} ``" -f $connectips[0], $connectips[1])
+            Write-Host ("      -VM1TestIp {0} -VM2TestIp {1} ``" -f $ipaddresses[$VMPrefix+1], $ipaddresses[$VMPrefix+2])
             Write-Host ("      -VMLocalAdminUser {0} -VMLocalAdminPassword '<password>'" -f $VMLocalAdminUser)
         }
         else {
-            Write-Host ("  ./AvZone-Latency-Test.ps1 -Mode TestOnly -Zone1 {0} -Zone2 {1} -Zone3 {2} ``" -f $connectips[0], $connectips[1], $connectips[2])
+            Write-Host ("  ./AvZone-Latency-SameZone.ps1 -Mode TestOnly -VM1 {0} -VM2 {1} ``" -f $connectips[0], $connectips[1])
             Write-Host ("      -VMLocalAdminUser {0} -VMLocalAdminPassword '<password>'" -f $VMLocalAdminUser)
         }
         if ($breakingchangewarning.Value -eq $true) {
@@ -503,14 +521,14 @@ Function Get-AdvancedNetworkStats {
 
     # creating SSH sessions to the VMs
     Write-Host -ForegroundColor Green "Creating SSH sessions"
-    For ($zone=1; $zone -le $zones; $zone++) {
-        $ipaddress = $connectips[$zone-1]
+    For ($vmindex=1; $vmindex -le $vmcount; $vmindex++) {
+        $ipaddress = $connectips[$vmindex-1]
         try {
             # checking TCP connectivity
             $_testresult = New-Object System.Net.Sockets.TcpClient($ipaddress, 22)
             if ($_testresult.Connected) {
                 # connected
-                Write-Host -ForegroundColor Green "TCP connection available to zone $zone VM with address $ipaddress"
+                Write-Host -ForegroundColor Green "TCP connection available to VM$vmindex with address $ipaddress"
                 if ($SSHKeyFilePath) {
                     $sshsession = New-SSHSession -ComputerName $ipaddress -Credential $Credential -KeyFile $SSHKeyFilePath -AcceptKey -Force
                 }
@@ -524,11 +542,11 @@ Function Get-AdvancedNetworkStats {
                 }
             }
             else {
-                Write-Host -ForegroundColor Red "unable to connect to SSH port for zone $zone VM $ipaddress. Please check if you can connect to the VM from your host using e.g. putty"
+                Write-Host -ForegroundColor Red "unable to connect to SSH port for VM$vmindex $ipaddress. Please check if you can connect to the VM from your host using e.g. putty"
             }
         }
         catch {
-            Write-Host -ForegroundColor Red "Failed to connect to zone $zone VM $ipaddress : $($_.Exception.Message)"
+            Write-Host -ForegroundColor Red "Failed to connect to VM$vmindex $ipaddress : $($_.Exception.Message)"
             exit
         }
     }
@@ -541,28 +559,30 @@ Function Get-AdvancedNetworkStats {
     # so TestOnly still needs no Azure control plane access or identity.
     Write-Host -ForegroundColor Green "Getting Hosts for virtual machines"
     $imdsInfo = @{}
-    For ($zone=1; $zone -le $zones; $zone++) {
+    For ($vmindex=1; $vmindex -le $vmcount; $vmindex++) {
 
-        $output = Invoke-SSHCommand -Command "strings /var/lib/hyperv/.kvp_pool_3 | sed -n '2 p'" -SessionId $sshsessions[$zone-1].SessionId
-        Write-Host ("zone $zone host: " + $output.Output)
+        $output = Invoke-SSHCommand -Command "strings /var/lib/hyperv/.kvp_pool_3 | sed -n '2 p'" -SessionId $sshsessions[$vmindex-1].SessionId
+        Write-Host ("VM$vmindex host: " + $output.Output)
 
         if ($Mode -eq "TestOnly") {
-            $imds = Invoke-SSHCommand -Command "curl -s -H 'Metadata:true' --max-time 5 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01&format=json'" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 20
+            $imds = Invoke-SSHCommand -Command "curl -s -H 'Metadata:true' --max-time 5 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01&format=json'" -SessionId $sshsessions[$vmindex-1].SessionId -TimeOut 20
             try {
                 $meta = ($imds.Output -join "`n") | ConvertFrom-Json
-                $imdsInfo[$zone] = $meta
-                Write-Host ("zone $zone IMDS: location=$($meta.location) vmSize=$($meta.vmSize) zone=$($meta.zone)")
-                if ($meta.zone -and $meta.zone -ne "$zone") {
-                    Write-Host -ForegroundColor Yellow "  note: zone $zone VM reports Azure zone '$($meta.zone)' (expected $zone)"
-                }
+                $imdsInfo[$vmindex] = $meta
+                Write-Host ("VM$vmindex IMDS: location=$($meta.location) vmSize=$($meta.vmSize) zone=$($meta.zone)")
             }
             catch {
-                Write-Host -ForegroundColor Yellow "zone $zone IMDS: not available (VM may not be on Azure or IMDS is blocked)"
+                Write-Host -ForegroundColor Yellow "VM$vmindex IMDS: not available (VM may not be on Azure or IMDS is blocked)"
             }
         }
     }
 
-    # TestOnly: auto-fill the report header labels from zone 1's IMDS data when not supplied
+    # TestOnly: warn if the two VMs report different Azure zones (this scenario expects the SAME zone)
+    if ($Mode -eq "TestOnly" -and $imdsInfo[1] -and $imdsInfo[2] -and $imdsInfo[1].zone -and $imdsInfo[2].zone -and ($imdsInfo[1].zone -ne $imdsInfo[2].zone)) {
+        Write-Host -ForegroundColor Yellow "  note: VM1 reports Azure zone '$($imdsInfo[1].zone)' but VM2 reports '$($imdsInfo[2].zone)' - this test assumes both VMs are in the SAME zone"
+    }
+
+    # TestOnly: auto-fill the report header labels from VM1's IMDS data when not supplied
     if ($Mode -eq "TestOnly") {
         if (-not $PSBoundParameters.ContainsKey('region') -and $imdsInfo[1] -and $imdsInfo[1].location) { $region = $imdsInfo[1].location }
         if (-not $PSBoundParameters.ContainsKey('VMSize') -and $imdsInfo[1] -and $imdsInfo[1].vmSize)   { $VMSize = $imdsInfo[1].vmSize }
@@ -573,68 +593,54 @@ Function Get-AdvancedNetworkStats {
     if ($testtool -eq "qperf") {
         # install qperf on all VMs
         Write-Host -ForegroundColor Green "Installing qperf, sockperf and iperf3 on all VMs"
-        For ($zone=1; $zone -le $zones; $zone++) {
+        For ($vmindex=1; $vmindex -le $vmcount; $vmindex++) {
 
             # wait for cloud-init to finish so the apt/dpkg lock is free
-            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S cloud-init status --wait" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 300 -ErrorAction silentlycontinue
+            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S cloud-init status --wait" -SessionId $sshsessions[$vmindex-1].SessionId -TimeOut 300 -ErrorAction silentlycontinue
             # make sure the universe repository (which provides sockperf/iperf3) is enabled
-            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S add-apt-repository -y universe" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 120 -ErrorAction silentlycontinue
+            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S add-apt-repository -y universe" -SessionId $sshsessions[$vmindex-1].SessionId -TimeOut 120 -ErrorAction silentlycontinue
             # run apt-get update first, then only install the tools if the update succeeded
-            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S sh -c 'DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y update && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y install qperf sockperf iperf3'" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 600
+            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | sudo -S sh -c 'DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y update && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y install qperf sockperf iperf3'" -SessionId $sshsessions[$vmindex-1].SessionId -TimeOut 600
             $installlog = $output.Output -join "`n"
 
             # verify the three tools are actually present, warn (and show apt output) if any is missing
-            $check = Invoke-SSHCommand -Command "for t in qperf sockperf iperf3; do command -v `$t >/dev/null 2>&1 && echo `$t=ok || echo `$t=MISSING; done" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 30
+            $check = Invoke-SSHCommand -Command "for t in qperf sockperf iperf3; do command -v `$t >/dev/null 2>&1 && echo `$t=ok || echo `$t=MISSING; done" -SessionId $sshsessions[$vmindex-1].SessionId -TimeOut 30
             $checktext = $check.Output -join "`n"
             if ($checktext -match 'MISSING') {
-                Write-Host -ForegroundColor Red "zone $zone : one or more tools failed to install -> $($check.Output -join ' ')"
-                Write-Host -ForegroundColor Yellow ("zone $zone apt output (tail): " + (($installlog -split "`n" | Select-Object -Last 8) -join "`n"))
+                Write-Host -ForegroundColor Red "VM$vmindex : one or more tools failed to install -> $($check.Output -join ' ')"
+                Write-Host -ForegroundColor Yellow ("VM$vmindex apt output (tail): " + (($installlog -split "`n" | Select-Object -Last 8) -join "`n"))
             }
             else {
-                Write-Host -ForegroundColor Green "zone $zone : qperf, sockperf and iperf3 installed"
+                Write-Host -ForegroundColor Green "VM$vmindex : qperf, sockperf and iperf3 installed"
             }
 
             # start the measurement servers
-            $output = Invoke-SSHCommand -Command "nohup qperf &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
-            $output = Invoke-SSHCommand -Command "nohup sockperf server >/dev/null 2>&1 &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
-            $output = Invoke-SSHCommand -Command "nohup iperf3 -s >/dev/null 2>&1 &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
+            $output = Invoke-SSHCommand -Command "nohup qperf &" -SessionId $sshsessions[$vmindex-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
+            $output = Invoke-SSHCommand -Command "nohup sockperf server >/dev/null 2>&1 &" -SessionId $sshsessions[$vmindex-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
+            $output = Invoke-SSHCommand -Command "nohup iperf3 -s >/dev/null 2>&1 &" -SessionId $sshsessions[$vmindex-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
 
         }
 
-        # run performance tests
+        # run performance tests between the two VMs in both directions
         Write-Host -ForegroundColor Green "Running bandwidth and latency tests"
-        For ($zone=1; $zone -le $zones; $zone++) {
+        $ipvm1 = $ipaddresses[$VMPrefix + 1]
+        $ipvm2 = $ipaddresses[$VMPrefix + 2]
+        $targets = @($ipvm2, $ipvm1)   # source VM1 tests VM2, source VM2 tests VM1
+        For ($vmindex=1; $vmindex -le $vmcount; $vmindex++) {
 
-            $vmtopingno1 = (( $zone   %3)+1)
-            $vmtoping1 = $VMPrefix + (( $zone   %3)+1)
-            $ipaddresstoping1 = $ipaddresses[$vmtoping1]
-            $vmtopingno2 = ((($zone+1)%3)+1)
-            $vmtoping2 = $VMPrefix + ((($zone+1)%3)+1)
-            $ipaddresstoping2 = $ipaddresses[$vmtoping2]
+            $targetip = $targets[$vmindex-1]
 
-            $output = Invoke-SSHCommand -Command "qperf $ipaddresstoping1 tcp_lat" -SessionId $sshsessions[$zone-1].SessionId
+            $output = Invoke-SSHCommand -Command "qperf $targetip tcp_lat" -SessionId $sshsessions[$vmindex-1].SessionId
             $latencytemp = [string]$output.Output[1]
             $latencytemp = $latencytemp.substring($latencytemp.IndexOf("=")+3)
             $latencytemp = $latencytemp.PadLeft(12)
-            $latency[$zone -1][$vmtopingno1 -1] = $latencytemp
+            $latency[$vmindex-1] = $latencytemp
 
-            $output = Invoke-SSHCommand -Command "qperf $ipaddresstoping1 tcp_bw" -SessionId $sshsessions[$zone-1].SessionId
+            $output = Invoke-SSHCommand -Command "qperf $targetip tcp_bw" -SessionId $sshsessions[$vmindex-1].SessionId
             $bandwidthtemp = [string]$output.Output[1]
             $bandwidthtemp = $bandwidthtemp.substring($bandwidthtemp.IndexOf("=")+3)
             $bandwidthtemp = $bandwidthtemp.PadLeft(12)
-            $bandwidth[$zone -1][$vmtopingno1 -1] = $bandwidthtemp
-
-            $output = Invoke-SSHCommand -Command "qperf $ipaddresstoping2 tcp_lat" -SessionId $sshsessions[$zone-1].SessionId
-            $latencytemp = [string]$output.Output[1]
-            $latencytemp = $latencytemp.substring($latencytemp.IndexOf("=")+3)
-            $latencytemp = $latencytemp.PadLeft(12)
-            $latency[$zone -1][$vmtopingno2 -1] = $latencytemp
-
-            $output = Invoke-SSHCommand -Command "qperf $ipaddresstoping2 tcp_bw" -SessionId $sshsessions[$zone-1].SessionId
-            $bandwidthtemp = [string]$output.Output[1]
-            $bandwidthtemp = $bandwidthtemp.substring($bandwidthtemp.IndexOf("=")+3)
-            $bandwidthtemp = $bandwidthtemp.PadLeft(12)
-            $bandwidth[$zone -1][$vmtopingno2 -1] = $bandwidthtemp
+            $bandwidth[$vmindex-1] = $bandwidthtemp
 
         }
 
@@ -650,105 +656,68 @@ Function Get-AdvancedNetworkStats {
         # run sockperf (idle + under-load) and iperf3 (TCP single/aggregate + UDP baseline/saturation) tests
         Write-Host -ForegroundColor Green "Running sockperf (idle + under-load) and iperf3 (TCP single/aggregate + UDP baseline/saturation) tests using $cores stream(s) for aggregate"
         $advresults = @()
-        For ($zone=1; $zone -le $zones; $zone++) {
-
-            $vmtopingno1 = (( $zone   %3)+1)
-            $vmtoping1 = $VMPrefix + $vmtopingno1
-            $ipaddresstoping1 = $ipaddresses[$vmtoping1]
-            $vmtopingno2 = ((($zone+1)%3)+1)
-            $vmtoping2 = $VMPrefix + $vmtopingno2
-            $ipaddresstoping2 = $ipaddresses[$vmtoping2]
-
-            $advresults += Get-AdvancedNetworkStats -SessionId $sshsessions[$zone-1].SessionId -TargetIp $ipaddresstoping1 -FromLabel "zone $zone" -ToLabel "zone $vmtopingno1" -Cores $cores
-            $advresults += Get-AdvancedNetworkStats -SessionId $sshsessions[$zone-1].SessionId -TargetIp $ipaddresstoping2 -FromLabel "zone $zone" -ToLabel "zone $vmtopingno2" -Cores $cores
-
-        }
+        $advresults += Get-AdvancedNetworkStats -SessionId $sshsessions[0].SessionId -TargetIp $ipvm2 -FromLabel "vm 1" -ToLabel "vm 2" -Cores $cores
+        $advresults += Get-AdvancedNetworkStats -SessionId $sshsessions[1].SessionId -TargetIp $ipvm1 -FromLabel "vm 2" -ToLabel "vm 1" -Cores $cores
     }
 
     if ($testtool -eq "niping") {
 
         # download niping on all hosts and run niping server
         Write-Host -ForegroundColor Green "Installing niping on all VMs"
-        For ($zone=1; $zone -le $zones; $zone++) {
+        For ($vmindex=1; $vmindex -le $vmcount; $vmindex++) {
 
-            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | wget $nipingpath -O /tmp/niping" -SessionId $sshsessions[$zone-1].SessionId
-            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | chmod +x /tmp/niping" -SessionId $sshsessions[$zone-1].SessionId
-            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | nohup /tmp/niping -s -I 0 &" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
+            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | wget $nipingpath -O /tmp/niping" -SessionId $sshsessions[$vmindex-1].SessionId
+            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | chmod +x /tmp/niping" -SessionId $sshsessions[$vmindex-1].SessionId
+            $output = Invoke-SSHCommand -Command "echo $VMLocalAdminPassword | nohup /tmp/niping -s -I 0 &" -SessionId $sshsessions[$vmindex-1].SessionId -TimeOut 3 -ErrorAction silentlycontinue
 
         }
 
-        # run performance tests
+        # run performance tests between the two VMs in both directions
         Write-Host -ForegroundColor Green "Running bandwidth and latency tests"
-        For ($zone=1; $zone -le $zones; $zone++) {
+        $ipvm1 = $ipaddresses[$VMPrefix + 1]
+        $ipvm2 = $ipaddresses[$VMPrefix + 2]
+        $targets = @($ipvm2, $ipvm1)   # source VM1 tests VM2, source VM2 tests VM1
+        For ($vmindex=1; $vmindex -le $vmcount; $vmindex++) {
 
-            $vmtopingno1 = (( $zone   %3)+1)
-            $vmtoping1 = $VMPrefix + (( $zone   %3)+1)
-            $ipaddresstoping1 = $ipaddresses[$vmtoping1]
-            $vmtopingno2 = ((($zone+1)%3)+1)
-            $vmtoping2 = $VMPrefix + ((($zone+1)%3)+1)
-            $ipaddresstoping2 = $ipaddresses[$vmtoping2]
+            $targetip = $targets[$vmindex-1]
 
-            $output = Invoke-SSHCommand -Command "/tmp/niping -c -B 10 -L 100 -H $ipaddresstoping1 | grep av2" -SessionId $sshsessions[$zone-1].SessionId
+            $output = Invoke-SSHCommand -Command "/tmp/niping -c -B 10 -L 100 -H $targetip | grep av2" -SessionId $sshsessions[$vmindex-1].SessionId
             $latencytemp = [string]$output.Output
             $latencytemp = $latencytemp -replace '\s+', ' '
             $latencytemp = $latencytemp -Split " "
             $latencytemp = [string]$latencytemp[1] + " " + $latencytemp[2]
             $latencytemp = $latencytemp.PadLeft(12)
-            $latency[$zone -1][$vmtopingno1 -1] = $latencytemp
+            $latency[$vmindex-1] = $latencytemp
 
-            $output = Invoke-SSHCommand -Command "/tmp/niping -c -B 100000 -L 100 -H $ipaddresstoping1 | grep tr2" -SessionId $sshsessions[$zone-1].SessionId
+            $output = Invoke-SSHCommand -Command "/tmp/niping -c -B 100000 -L 100 -H $targetip | grep tr2" -SessionId $sshsessions[$vmindex-1].SessionId
             $bandwidthtemp = [string]$output.Output
             $bandwidthtemp = $bandwidthtemp -replace '\s+', ' '
             $bandwidthtemp = $bandwidthtemp -Split ". "
             $bandwidthtemp = [int]$bandwidthtemp[1] / 1024
             $bandwidthtemp = [string]([math]::ceiling($bandwidthtemp)) + " MB/s"
             $bandwidthtemp = $bandwidthtemp.PadLeft(12)
-            $bandwidth[$zone -1][$vmtopingno1 -1] = $bandwidthtemp
-
-            $output = Invoke-SSHCommand -Command "/tmp/niping -c -B 10 -L 100 -H $ipaddresstoping2 | grep av2" -SessionId $sshsessions[$zone-1].SessionId
-            $latencytemp = [string]$output.Output
-            $latencytemp = $latencytemp -replace '\s+', ' '
-            $latencytemp = $latencytemp -Split " "
-            $latencytemp = [string]$latencytemp[1] + " " + $latencytemp[2]
-            $latencytemp = $latencytemp.PadLeft(12)
-            $latency[$zone -1][$vmtopingno2 -1] = $latencytemp
-
-            $output = Invoke-SSHCommand -Command "/tmp/niping -c -B 100000 -L 100 -H $ipaddresstoping2 | grep tr2" -SessionId $sshsessions[$zone-1].SessionId
-            $bandwidthtemp = [string]$output.Output
-            $bandwidthtemp = $bandwidthtemp -replace '\s+', ' '
-            $bandwidthtemp = $bandwidthtemp -Split ". "
-            $bandwidthtemp = [int]$bandwidthtemp[1] / 1024
-            $bandwidthtemp = [string]([math]::ceiling($bandwidthtemp)) + " MB/s"
-            $bandwidthtemp = $bandwidthtemp.PadLeft(12)
-            $bandwidth[$zone -1][$vmtopingno2 -1] = $bandwidthtemp
+            $bandwidth[$vmindex-1] = $bandwidthtemp
 
         }
     }
 
     # Print output
     Write-Host "Region: " $region
+    Write-Host "Zone: " $Zone
+    Write-Host "Proximity Placement Group: " $(if ($Mode -eq "TestOnly") { "(see IMDS zone notes above)" } elseif ($UseProximityPlacementGroup) { "enabled" } else { "disabled" })
     Write-Host "VM Type: " $VMSize
 
-    Write-Host "Latency (qperf tcp_lat - one-way latency, i.e. ~half the round-trip, in us):"
-
-    Write-Host "         ----------------------------------------------"
-    Write-Host "         |    zone 1    |    zone 2    |    zone 3    |"
-    Write-Host "-------------------------------------------------------"
-    Write-Host "| zone 1 |              |" $latency[0][1] "|" $latency[0][2] "|"
-    Write-Host "| zone 2 |" $latency[1][0] "|              |" $latency[1][2] "|"
-    Write-Host "| zone 3 |" $latency[2][0] "|" $latency[2][1] "|              |"
-    Write-Host "-------------------------------------------------------"
+    $qperfResults = @(
+        [PSCustomObject]@{ From = "vm 1"; To = "vm 2"; Latency = $latency[0].Trim(); Bandwidth = $bandwidth[0].Trim() }
+        [PSCustomObject]@{ From = "vm 2"; To = "vm 1"; Latency = $latency[1].Trim(); Bandwidth = $bandwidth[1].Trim() }
+    )
 
     Write-Host ""
-    Write-Host "Bandwidth (qperf tcp_bw, in MB/sec):"
+    Write-Host "Latency (qperf tcp_lat - one-way latency, i.e. ~half the round-trip, in us):"
+    $qperfResults | Format-Table From, To, Latency -AutoSize | Out-String -Width 4096 | Write-Host
 
-    Write-Host "         ----------------------------------------------"
-    Write-Host "         |    zone 1    |    zone 2    |    zone 3    |"
-    Write-Host "-------------------------------------------------------"
-    Write-Host "| zone 1 |              |" $bandwidth[0][1] "|" $bandwidth[0][2] "|"
-    Write-Host "| zone 2 |" $bandwidth[1][0] "|              |" $bandwidth[1][2] "|"
-    Write-Host "| zone 3 |" $bandwidth[2][0] "|" $bandwidth[2][1] "|              |"
-    Write-Host "-------------------------------------------------------"
+    Write-Host "Bandwidth (qperf tcp_bw, in MB/sec):"
+    $qperfResults | Format-Table From, To, Bandwidth -AutoSize | Out-String -Width 4096 | Write-Host
 
     if ($advresults) {
         Write-Host ""
