@@ -298,6 +298,23 @@ Function Get-AdvancedNetworkStats {
     }
 }
 
+
+Function Write-Result {
+    # Writes a results line to the console (as before) and also appends it to the results file.
+    [CmdletBinding()]
+    Param (
+        [Parameter(ValueFromPipeline = $true, Position = 0)] $Message = ""
+    )
+    process {
+        $text = [string]$Message
+        Write-Host $text
+        if ($script:ResultLogPath) { Add-Content -Path $script:ResultLogPath -Value $text }
+    }
+}
+
+    # path of the timestamped results file; set at the start of the test phase
+    $script:ResultLogPath = $null
+
     # work out which capabilities this mode needs
     $needAzure = $Mode -in @("DeployAndTest","DeployOnly")
     $needSSH   = $Mode -in @("DeployAndTest","TestOnly")
@@ -494,6 +511,13 @@ Function Get-AdvancedNetworkStats {
 
     # ---- TEST phase (DeployAndTest / TestOnly) ----
 
+    # measurement results and host details are mirrored to a timestamped file in the script folder
+    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $script:ResultLogPath = Join-Path $scriptDir ("AvZone-Latency-Test-results-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    Write-Host -ForegroundColor Green "Writing results to $script:ResultLogPath"
+    Add-Content -Path $script:ResultLogPath -Value ("AvZone-Latency-Test results - {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    Add-Content -Path $script:ResultLogPath -Value "Mode: $Mode"
+
     # removing all open ssh sessions
     Get-SSHTrustedHost | Remove-SSHTrustedHost
     $sshsessions = Get-SSHSession
@@ -544,14 +568,14 @@ Function Get-AdvancedNetworkStats {
     For ($zone=1; $zone -le $zones; $zone++) {
 
         $output = Invoke-SSHCommand -Command "strings /var/lib/hyperv/.kvp_pool_3 | sed -n '2 p'" -SessionId $sshsessions[$zone-1].SessionId
-        Write-Host ("zone $zone host: " + $output.Output)
+        Write-Result ("zone $zone host: " + $output.Output)
 
         if ($Mode -eq "TestOnly") {
             $imds = Invoke-SSHCommand -Command "curl -s -H 'Metadata:true' --max-time 5 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01&format=json'" -SessionId $sshsessions[$zone-1].SessionId -TimeOut 20
             try {
                 $meta = ($imds.Output -join "`n") | ConvertFrom-Json
                 $imdsInfo[$zone] = $meta
-                Write-Host ("zone $zone IMDS: location=$($meta.location) vmSize=$($meta.vmSize) zone=$($meta.zone)")
+                Write-Result ("zone $zone IMDS: location=$($meta.location) vmSize=$($meta.vmSize) zone=$($meta.zone)")
                 if ($meta.zone -and $meta.zone -ne "$zone") {
                     Write-Host -ForegroundColor Yellow "  note: zone $zone VM reports Azure zone '$($meta.zone)' (expected $zone)"
                 }
@@ -725,47 +749,51 @@ Function Get-AdvancedNetworkStats {
         }
     }
 
-    # Print output
-    Write-Host "Region: " $region
-    Write-Host "VM Type: " $VMSize
+    # Print output (console unchanged; the same result lines are appended to the results file)
+    if ($script:ResultLogPath) {
+        Add-Content -Path $script:ResultLogPath -Value ""
+        Add-Content -Path $script:ResultLogPath -Value ("-" * 70)
+    }
+    Write-Result "Region:  $region"
+    Write-Result "VM Type:  $VMSize"
 
-    Write-Host "Latency (qperf tcp_lat - one-way latency, i.e. ~half the round-trip, in us):"
+    Write-Result "Latency (qperf tcp_lat - one-way latency, i.e. ~half the round-trip, in us):"
 
-    Write-Host "         ----------------------------------------------"
-    Write-Host "         |    zone 1    |    zone 2    |    zone 3    |"
-    Write-Host "-------------------------------------------------------"
-    Write-Host "| zone 1 |              |" $latency[0][1] "|" $latency[0][2] "|"
-    Write-Host "| zone 2 |" $latency[1][0] "|              |" $latency[1][2] "|"
-    Write-Host "| zone 3 |" $latency[2][0] "|" $latency[2][1] "|              |"
-    Write-Host "-------------------------------------------------------"
+    Write-Result "         ----------------------------------------------"
+    Write-Result "         |    zone 1    |    zone 2    |    zone 3    |"
+    Write-Result "-------------------------------------------------------"
+    Write-Result ("| zone 1 |              | {0} | {1} |" -f $latency[0][1], $latency[0][2])
+    Write-Result ("| zone 2 | {0} |              | {1} |" -f $latency[1][0], $latency[1][2])
+    Write-Result ("| zone 3 | {0} | {1} |              |" -f $latency[2][0], $latency[2][1])
+    Write-Result "-------------------------------------------------------"
 
-    Write-Host ""
-    Write-Host "Bandwidth (qperf tcp_bw, in MB/sec):"
+    Write-Result ""
+    Write-Result "Bandwidth (qperf tcp_bw, in MB/sec):"
 
-    Write-Host "         ----------------------------------------------"
-    Write-Host "         |    zone 1    |    zone 2    |    zone 3    |"
-    Write-Host "-------------------------------------------------------"
-    Write-Host "| zone 1 |              |" $bandwidth[0][1] "|" $bandwidth[0][2] "|"
-    Write-Host "| zone 2 |" $bandwidth[1][0] "|              |" $bandwidth[1][2] "|"
-    Write-Host "| zone 3 |" $bandwidth[2][0] "|" $bandwidth[2][1] "|              |"
-    Write-Host "-------------------------------------------------------"
+    Write-Result "         ----------------------------------------------"
+    Write-Result "         |    zone 1    |    zone 2    |    zone 3    |"
+    Write-Result "-------------------------------------------------------"
+    Write-Result ("| zone 1 |              | {0} | {1} |" -f $bandwidth[0][1], $bandwidth[0][2])
+    Write-Result ("| zone 2 | {0} |              | {1} |" -f $bandwidth[1][0], $bandwidth[1][2])
+    Write-Result ("| zone 3 | {0} | {1} |              |" -f $bandwidth[2][0], $bandwidth[2][1])
+    Write-Result "-------------------------------------------------------"
 
     if ($advresults) {
-        Write-Host ""
-        Write-Host "sockperf idle one-way latency in us (one-way = ~half round-trip; comparable to the qperf latency table above):"
-        $advresults | Format-Table From, To, 'OWAvg(us)', 'OWP90(us)', 'OWP99(us)', 'OWMax(us)' -AutoSize | Out-String -Width 4096 | Write-Host
+        Write-Result ""
+        Write-Result "sockperf idle one-way latency in us (one-way = ~half round-trip; comparable to the qperf latency table above):"
+        $advresults | Format-Table From, To, 'OWAvg(us)', 'OWP90(us)', 'OWP99(us)', 'OWMax(us)' -AutoSize | Out-String -Width 4096 | Write-Result
 
-        Write-Host "sockperf idle full round-trip time (RTT) in us (--full-rtt pass):"
-        $advresults | Format-Table From, To, 'RTTAvg(us)', 'RTTP90(us)', 'RTTP99(us)', 'RTTMax(us)' -AutoSize | Out-String -Width 4096 | Write-Host
+        Write-Result "sockperf idle full round-trip time (RTT) in us (--full-rtt pass):"
+        $advresults | Format-Table From, To, 'RTTAvg(us)', 'RTTP90(us)', 'RTTP99(us)', 'RTTMax(us)' -AutoSize | Out-String -Width 4096 | Write-Result
 
-        Write-Host "RTT under load in us - bufferbloat (idle RTT avg vs RTT measured during an iperf3 TCP transfer):"
-        $advresults | Format-Table From, To, 'RTTAvg(us)', 'LoadRTTavg(us)', 'LoadRTTp99(us)' -AutoSize | Out-String -Width 4096 | Write-Host
+        Write-Result "RTT under load in us - bufferbloat (idle RTT avg vs RTT measured during an iperf3 TCP transfer):"
+        $advresults | Format-Table From, To, 'RTTAvg(us)', 'LoadRTTavg(us)', 'LoadRTTp99(us)' -AutoSize | Out-String -Width 4096 | Write-Result
 
-        Write-Host "iperf3 TCP throughput in MB/sec - single flow (avg/P90/P99/max, warm-up dropped), retransmits, and aggregate over $cores parallel streams:"
-        $advresults | Format-Table From, To, 'TCP1avg(MB/s)', 'TCP1p90(MB/s)', 'TCP1p99(MB/s)', 'TCP1max(MB/s)', 'Retr', 'TCPagg(MB/s)' -AutoSize | Out-String -Width 4096 | Write-Host
+        Write-Result "iperf3 TCP throughput in MB/sec - single flow (avg/P90/P99/max, warm-up dropped), retransmits, and aggregate over $cores parallel streams:"
+        $advresults | Format-Table From, To, 'TCP1avg(MB/s)', 'TCP1p90(MB/s)', 'TCP1p99(MB/s)', 'TCP1max(MB/s)', 'Retr', 'TCPagg(MB/s)' -AutoSize | Out-String -Width 4096 | Write-Result
 
-        Write-Host "iperf3 UDP packet loss %/jitter (ms) - baseline (100 Mbps, organic) vs saturation (~TCP rate, load-induced):"
-        $advresults | Format-Table From, To, 'UDPbLoss(%)', 'UDPbJit(ms)', 'UDPsAvg(MB/s)', 'UDPsLoss(%)', 'UDPsJit(ms)' -AutoSize | Out-String -Width 4096 | Write-Host
+        Write-Result "iperf3 UDP packet loss %/jitter (ms) - baseline (100 Mbps, organic) vs saturation (~TCP rate, load-induced):"
+        $advresults | Format-Table From, To, 'UDPbLoss(%)', 'UDPbJit(ms)', 'UDPsAvg(MB/s)', 'UDPsLoss(%)', 'UDPsJit(ms)' -AutoSize | Out-String -Width 4096 | Write-Result
     }
 
 
