@@ -9,6 +9,7 @@ usage() {
     printf '%s\n' \
         'Usage: bash multinic-routing.sh [--discover | --apply | --rollback | --verify] OPTIONS' \
         'Default: read-only plan. Changes are runtime-only (main IPv4 table).' \
+        'Gateways: overrides > configured evidence > Azure subnet network + 1 (/2 through /29).' \
         '  --route CIDR[=LOCAL_IP_OR_INTERFACE_OR_MAC]  Repeatable; no default routes.' \
         '  --gateway INTERFACE_OR_IP_OR_MAC=GATEWAY   Repeatable override.' \
         '  --primary INTERFACE_OR_IP_OR_MAC          Override primary identity.' \
@@ -149,7 +150,7 @@ gateway_for() {
                 if [[ $line =~ ^routers[[:space:]]*=[[:space:]]*(.*)$ ]]; then
                     for entry in ${BASH_REMATCH[1]}; do evidence_values+=("$entry|DHCP-routers"); done
                 fi
-            done <<< "$value"
+            done <<< "${value// | /$'\n'}"
         fi
         for entry in "${evidence_values[@]}"; do
             value=${entry%%|*}
@@ -157,12 +158,19 @@ gateway_for() {
             candidate=$value; evidence+="${entry#*|},"
         done
     fi
-    [[ -n $candidate ]] || fail "No gateway evidence for $device; use --gateway $device=ACTUAL_GATEWAY."
+    local other number length network gateway_number
+    read -r number length network < <(cidr_parts "${addresses[index]}") || fail "Invalid configured prefix: ${addresses[index]}"
+    if [[ -z $candidate ]]; then
+        (( length >= 2 && length <= 29 )) || fail "Cannot calculate an Azure gateway from ${addresses[index]} on $device; use --gateway $device=ACTUAL_GATEWAY."
+        gateway_number=$((network + 1))
+        printf -v candidate '%d.%d.%d.%d' \
+            "$(((gateway_number >> 24) & 255))" "$(((gateway_number >> 16) & 255))" \
+            "$(((gateway_number >> 8) & 255))" "$((gateway_number & 255))"
+        evidence="Azure-subnet-network-plus-one(${addresses[index]})"
+    fi
     ipv4_number "$candidate" >/dev/null || fail "Invalid gateway: $candidate"
     contains "${addresses[index]}" "$candidate" || fail "Gateway $candidate is outside ${addresses[index]} on $device."
-    local other number length network gateway_number
     for other in "${addresses[@]}"; do [[ ${other%/*} != "$candidate" ]] || fail 'Gateway is a local address.'; done
-    read -r number length network < <(cidr_parts "${addresses[index]}")
     gateway_number=$(ipv4_number "$candidate")
     if ((length < 31)); then
         (( gateway_number != network && gateway_number != (network | (0xffffffff >> length)) )) || fail 'Gateway is a subnet network/broadcast address.'
