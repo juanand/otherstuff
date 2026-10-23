@@ -8,7 +8,7 @@ warn() { printf 'WARNING: %s\n' "$*" >&2; }
 usage() {
     printf '%s\n' \
         'Usage: bash multinic-routing.sh [--discover | --apply | --rollback | --verify] OPTIONS' \
-        'Default: read-only plan. Changes are runtime-only (main IPv4 table).' \
+        'Default: read-only plan. Routes are runtime-only unless --persist is supplied.' \
         'Gateways: overrides > configured evidence > Azure subnet network + 1 (/2 through /29).' \
         '  --route CIDR[=LOCAL_IP_OR_INTERFACE_OR_MAC]  Repeatable; no default routes.' \
         '  --gateway INTERFACE_OR_IP_OR_MAC=GATEWAY   Repeatable override.' \
@@ -16,6 +16,7 @@ usage() {
         '  --peer LOCAL_IP=REMOTE_IP                 Repeatable route-get verification.' \
         '  --protect-peer LOCAL_IP=REMOTE_IP         Refuse a plan changing this path.' \
         '  --allow-connected-overlap                Acknowledge direct connected subroutes.' \
+        '  --persist                                Save owned routes in NetworkManager profiles.' \
         '  --apply                                  Root only; add reviewed routes.' \
         '  --rollback                               Root only; remove journal-owned routes.' \
         '  --verify                                 Read-only route and peer checks.' \
@@ -178,14 +179,164 @@ gateway_for() {
     printf '%s|%s\n' "$candidate" "$evidence"
 }
 
+networkmanager_routes() {
+    local uuid=$1 raw entry field key value seen cidr gateway metric source table supported number length network position
+    local -a entries=() fields=()
+    raw=$(nmcli --escape no -g ipv4.routes connection show uuid "$uuid") || fail "Cannot read saved routes for profile $uuid."
+    [[ $raw != -- ]] || raw=''
+    IFS=, read -r -a entries <<< "${raw//$'\n'/,}"
+    for entry in "${entries[@]}"; do
+        read -r -a fields <<< "$entry"
+        ((${#fields[@]})) || continue
+        cidr=${fields[0]}; gateway=0.0.0.0; metric=-1; source=''; table=0; supported=true; seen='|'; position=1
+        if ((position < ${#fields[@]})) && ipv4_number "${fields[position]}" >/dev/null; then
+            gateway=${fields[position]}; position=$((position+1))
+        fi
+        if ((position < ${#fields[@]})) && [[ ${fields[position]} =~ ^[0-9]+$ ]]; then
+            metric=${fields[position]}; position=$((position+1))
+        fi
+        for field in "${fields[@]:position}"; do
+            [[ $field =~ ^[a-zA-Z0-9_-]+=.+$ ]] || fail "Unsupported NetworkManager route field for $uuid: $field"
+            key=${field%%=*}; value=${field#*=}
+            [[ $seen != *"|$key|"* ]] || fail "Duplicate NetworkManager route field: $key"
+            seen+="$key|"
+            case $key in
+                src) source=$value ;;
+                table) table=$value ;;
+                *) supported=false ;;
+            esac
+        done
+        [[ $cidr == */* ]] || cidr+='/32'
+        read -r number length network < <(cidr_parts "$cidr") || fail "Invalid saved route prefix: $cidr"
+        ((number == network)) || fail "Noncanonical saved route prefix: $cidr"
+        ipv4_number "$gateway" >/dev/null || fail "Invalid saved route gateway: $gateway"
+        [[ -z $source ]] || ipv4_number "$source" >/dev/null || fail "Invalid saved route source: $source"
+        [[ $metric =~ ^(-1|[0-9]+)$ && $table =~ ^[0-9]+$ ]] || fail 'Invalid saved route metric/table.'
+        printf '%s|%s|%s|%s|%s|%s\n' "$cidr" "$gateway" "$metric" "$source" "$table" "$supported"
+    done
+}
+
+saved_route_status() {
+    local uuid=$1 cidr=$2 gateway=$3 source=$4 entries destination next_hop metric preferred_source table supported count=0
+    entries=$(networkmanager_routes "$uuid") || fail 'Cannot assess saved route ownership.'
+    while IFS='|' read -r destination next_hop metric preferred_source table supported; do
+        [[ $destination == "$cidr" ]] || continue
+        [[ $next_hop == "$gateway" && $metric == 42760 && $preferred_source == "$source" &&
+           $table == 254 && $supported == true ]] || fail "Saved route collision for $cidr in profile $uuid."
+        count=$((count+1))
+    done <<< "$entries"
+    ((count <= 1)) || fail "Duplicate saved routes for $cidr in profile $uuid."
+    if ((count)); then printf 'present\n'; else printf 'absent\n'; fi
+}
+
+load_persistent_state() {
+    local record uuid cidr device gateway source extra
+    persistent_records=()
+    if [[ -e $state_dir/networkmanager ]]; then
+        [[ -f $state_dir/networkmanager && ! -L $state_dir/networkmanager ]] || fail 'Unsafe persistent journal path.'
+        mapfile -t persistent_records < "$state_dir/networkmanager" || fail 'Cannot read persistent journal; use root if it is protected.'
+        for record in "${persistent_records[@]}"; do
+            IFS='|' read -r uuid cidr device gateway source extra <<< "$record"
+            [[ $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ &&
+               $device =~ ^[a-zA-Z0-9_.:-]+$ && -z ${extra:-} ]] || fail 'Invalid persistent journal record.'
+            canonical_cidr "$cidr"
+            ipv4_number "$gateway" >/dev/null && ipv4_number "$source" >/dev/null || fail 'Invalid persistent journal IP.'
+            [[ -f $state_file ]] && grep -Fxq "$cidr|$device|$gateway|$source" "$state_file" || fail 'Persistent journal does not match the runtime journal.'
+        done
+    fi
+}
+
+prepare_persistence() {
+    local record cidr device gateway source uuid autoconnect permissions profile status existing profile_device files filename file_uuid file_path matches
+    command -v nmcli >/dev/null || fail '--persist requires the active NetworkManager backend and nmcli.'
+    persistent_plan=()
+    for record in "${plan[@]}"; do
+        IFS='|' read -r cidr device gateway source <<< "$record"
+        uuid=$(nmcli --escape no -g GENERAL.CON-UUID device show "$device") || fail "Cannot find an active NetworkManager profile for $device."
+        [[ $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || fail "No unique active NetworkManager profile for $device."
+        files=$(nmcli --terse --escape no -f UUID,FILENAME connection show) || fail 'Cannot inspect NetworkManager profile storage.'
+        filename=''; matches=0
+        while IFS=: read -r file_uuid file_path; do
+            [[ $file_uuid == "$uuid" ]] || continue
+            filename=$file_path; matches=$((matches+1))
+        done <<< "$files"
+        [[ $matches == 1 && $filename == /etc/* ]] || fail "Profile $uuid is not uniquely saved under /etc; temporary/generated profiles need explicit administrator review."
+        autoconnect=$(nmcli --escape no -g connection.autoconnect connection show uuid "$uuid") || fail 'Cannot read profile autoconnect setting.'
+        [[ $autoconnect == yes || $autoconnect == true ]] || fail "Profile $uuid does not autoconnect; persistence would not be reliable at boot."
+        permissions=$(nmcli --escape no -g connection.permissions connection show uuid "$uuid") || fail 'Cannot read profile permissions.'
+        [[ -z $permissions || $permissions == -- ]] || fail "Profile $uuid is user-restricted and may not activate at boot."
+        for existing in "${persistent_plan[@]}"; do
+            profile=${existing%%|*}; profile_device=${existing#*|*|}; profile_device=${profile_device%%|*}
+            [[ $profile != "$uuid" || $profile_device == "$device" ]] || fail "Profile $uuid is shared by multiple mapped devices."
+        done
+        status=$(saved_route_status "$uuid" "$cidr" "$gateway" "$source") || fail 'Cannot establish persistent route state.'
+        if [[ $status == present ]]; then
+            local owned=false
+            for existing in "${persistent_records[@]}"; do [[ $existing != "$uuid|$record" ]] || owned=true; done
+            $owned || fail "Existing saved route for $cidr is not journal-owned."
+        fi
+        persistent_plan+=("$uuid|$record")
+        printf 'PERSIST %s profile=%s route="%s %s 42760 src=%s table=254" state=%s\n' "$device" "$uuid" "$cidr" "$gateway" "$source" "$status"
+    done
+    if [[ -f $state_dir/networkmanager ]]; then
+        [[ $(printf '%s\n' "${persistent_records[@]}") == "$(printf '%s\n' "${persistent_plan[@]}")" ]] || fail 'Different persistent plan exists; roll it back with --rollback --persist before changing it.'
+    fi
+}
+
+apply_persistence() {
+    local record uuid cidr device gateway source status temporary
+    if [[ ! -f $state_dir/networkmanager ]]; then
+        temporary=$(mktemp "$state_dir/networkmanager.XXXXXX") || fail 'Cannot create persistent journal.'
+        chmod 600 "$temporary"
+        printf '%s\n' "${persistent_plan[@]}" > "$temporary"
+        mv -- "$temporary" "$state_dir/networkmanager"
+    fi
+    for record in "${persistent_plan[@]}"; do
+        IFS='|' read -r uuid cidr device gateway source <<< "$record"
+        status=$(saved_route_status "$uuid" "$cidr" "$gateway" "$source") || fail 'Saved routes changed during apply; journal retained.'
+        if [[ $status == absent ]]; then
+            nmcli connection modify uuid "$uuid" +ipv4.routes "$cidr $gateway 42760 src=$source table=254" || fail 'Persistent apply failed; journals retained. Review state before --rollback --persist.'
+        fi
+        [[ $(saved_route_status "$uuid" "$cidr" "$gateway" "$source") == present ]] || fail 'Persistent route verification failed; journals retained.'
+    done
+    printf 'Routes saved in NetworkManager profiles; no profile was reactivated.\n'
+}
+
+rollback_persistence() {
+    local record uuid cidr device gateway source status
+    command -v nmcli >/dev/null || fail 'nmcli is required to roll back persistent routes.'
+    for record in "${persistent_records[@]}"; do
+        IFS='|' read -r uuid cidr device gateway source <<< "$record"
+        status=$(saved_route_status "$uuid" "$cidr" "$gateway" "$source") || fail 'Persistent route changed externally; journals retained.'
+    done
+    for record in "${persistent_records[@]}"; do
+        IFS='|' read -r uuid cidr device gateway source <<< "$record"
+        status=$(saved_route_status "$uuid" "$cidr" "$gateway" "$source") || fail 'Persistent route changed during rollback; journals retained.'
+        if [[ $status == present ]]; then
+            nmcli connection modify uuid "$uuid" -ipv4.routes "$cidr $gateway 42760 src=$source table=254" || fail 'Persistent rollback failed; journals retained.'
+        fi
+        [[ $(saved_route_status "$uuid" "$cidr" "$gateway" "$source") == absent ]] || fail 'Saved route remains after rollback; journals retained.'
+    done
+}
+
 owned_route_present() {
-    local cidr=$1 device=$2 gateway=$3 source=$4 line exact
+    local cidr=$1 device=$2 gateway=$3 source=$4 line exact protocol record uuid status
     exact=$(ip -N -4 -o route show table main exact "$cidr") || fail 'Cannot query route.'
     [[ -n $exact && $exact != *$'\n'* ]] || return 1
     line=$exact
     [[ $(route_field "$line" dev) == "$device" && $(route_field "$line" via) == "$gateway" &&
        $(route_field "$line" src) == "$source" && $(route_field "$line" metric) == 42760 &&
-    $(route_field "$line" proto) == 242 && $line != *nexthop* ]]
+       $line != *nexthop* ]] || return 1
+    protocol=$(route_field "$line" proto)
+    [[ $protocol != 242 ]] || return 0
+    [[ $protocol == 4 || $protocol == static ]] || return 1
+    for record in "${persistent_records[@]}"; do
+        [[ ${record#*|} == "$cidr|$device|$gateway|$source" ]] || continue
+        uuid=${record%%|*}
+        status=$(saved_route_status "$uuid" "$cidr" "$gateway" "$source") || fail 'Cannot verify NetworkManager route ownership.'
+        if [[ $status == present || ${5:-false} == true ]]; then return 0; fi
+    done
+    return 1
 }
 
 build_plan() {
@@ -255,6 +406,11 @@ mutate_route() {
     ip -4 route "$action" "$cidr" via "$gateway" dev "$device" src "$source" proto 242 metric 42760
 }
 
+state_paths() {
+    state_dir=/var/lib/azure-multinic
+    state_file=$state_dir/routes
+}
+
 lock_state() {
     ((EUID == 0)) || fail 'Root is required only for apply/rollback.'
     command -v flock >/dev/null || fail 'flock (normally supplied by util-linux) is required for mutation.'
@@ -264,6 +420,10 @@ lock_state() {
     if [[ -e $state_file ]]; then
         [[ -f $state_file && $(stat -c '%u:%a' "$state_file") == 0:600 ]] || fail 'Unsafe state journal permissions.'
     fi
+    if [[ -e $state_dir/networkmanager || -L $state_dir/networkmanager ]]; then
+        [[ -f $state_dir/networkmanager && ! -L $state_dir/networkmanager &&
+           $(stat -c '%u:%a' "$state_dir/networkmanager") == 0:600 ]] || fail 'Unsafe persistent journal permissions.'
+    fi
     exec 9>"$state_dir/lock"
     flock -n 9 || fail 'Another routing operation is running.'
 }
@@ -272,6 +432,7 @@ rollback() {
     local cidr device gateway source extra
     [[ -f $state_file ]] || { printf 'No owned routes to roll back.\n'; return; }
     local -a saved=()
+    local -a removable=()
     mapfile -t saved < "$state_file"
     local record
     for record in "${saved[@]}"; do
@@ -279,12 +440,23 @@ rollback() {
         canonical_cidr "$cidr"
         [[ -z ${extra:-} && $device =~ ^[a-zA-Z0-9_.:-]+$ ]] || fail 'Invalid journal record.'
         ipv4_number "$gateway" >/dev/null && ipv4_number "$source" >/dev/null || fail 'Invalid journal IP.'
-        if owned_route_present "$cidr" "$device" "$gateway" "$source"; then
-            mutate_route del "$cidr" "$device" "$gateway" "$source" || fail 'Rollback failed; journal retained.'
+        if owned_route_present "$cidr" "$device" "$gateway" "$source" true; then
+            removable+=("$record|$(route_field "$(ip -N -4 -o route show table main exact "$cidr")" proto)")
         elif [[ -n $(ip -N -4 -o route show table main exact "$cidr") ]]; then
             fail "Owned route changed externally: $cidr. Refusing to delete; journal retained."
         fi
     done
+    if [[ -f $state_dir/networkmanager ]]; then rollback_persistence; fi
+    local protocol
+    for record in "${removable[@]}"; do
+        IFS='|' read -r cidr device gateway source protocol <<< "$record"
+        if [[ $protocol == 242 ]]; then
+            mutate_route del "$cidr" "$device" "$gateway" "$source" || fail 'Rollback failed; journals retained.'
+        else
+            ip -4 route del "$cidr" via "$gateway" dev "$device" src "$source" proto "$protocol" metric 42760 || fail 'Rollback failed; journals retained.'
+        fi
+    done
+    if [[ -f $state_dir/networkmanager ]]; then rm -- "$state_dir/networkmanager"; fi
     rm -- "$state_file"
     printf 'Rollback complete. Unrelated routes were not removed.\n'
 }
@@ -337,9 +509,9 @@ protect_management() {
 
 main() {
     local mode=plan arg evidence index record cidr device gateway source temporary
-    primary_override=''; allow_connected=false
-    state_dir=/var/lib/azure-multinic; state_file=$state_dir/routes
-    mappings=(); gateway_overrides=(); peers=(); protected_peers=(); plan=()
+    primary_override=''; allow_connected=false; persist=false
+    state_paths
+    mappings=(); gateway_overrides=(); peers=(); protected_peers=(); plan=(); persistent_records=(); persistent_plan=()
     while (($#)); do
         arg=$1; shift
         case $arg in
@@ -347,6 +519,7 @@ main() {
             --discover|--apply|--rollback|--verify)
                 [[ $mode == plan ]] || fail 'Choose only one operation.'; mode=${arg#--} ;;
             --allow-connected-overlap) allow_connected=true ;;
+            --persist) persist=true ;;
             --route|--gateway|--primary|--peer|--protect-peer)
                 (($#)) && [[ -n $1 && $1 != --* ]] || fail "Missing argument for $arg"
                 case $arg in
@@ -362,6 +535,10 @@ main() {
     done
     command -v ip >/dev/null || fail 'iproute2 is required.'
     if [[ $mode == apply || $mode == rollback ]]; then lock_state; fi
+    load_persistent_state
+    if [[ -f $state_dir/networkmanager && ( $mode == apply || $mode == rollback ) && $persist == false ]]; then
+        fail 'This plan owns persistent routes; include --persist to apply or roll it back.'
+    fi
     if [[ $mode == rollback ]]; then rollback; return; fi
     load_inventory
     find_primary
@@ -398,7 +575,12 @@ main() {
     done
     build_plan
     protect_management
-    printf 'Runtime-only plan (no primary default-route changes):\n'
+    if $persist || [[ -f $state_dir/networkmanager ]]; then
+        prepare_persistence
+        printf 'Runtime and NetworkManager persistent plan (no primary default-route changes):\n'
+    else
+        printf 'Runtime-only plan (no primary default-route changes):\n'
+    fi
     printf '  %s\n' "${plan[@]}"
     warn 'Destination routes do not ensure arbitrary source symmetry. Azure transit/peering/UDRs and NSG/firewall permission must already exist.'
     if [[ $mode == apply ]]; then
@@ -410,6 +592,7 @@ main() {
             printf '%s\n' "${plan[@]}" > "$temporary"
             mv -- "$temporary" "$state_file"
         fi
+        if $persist; then apply_persistence; load_persistent_state; fi
         for record in "${plan[@]}"; do
             IFS='|' read -r cidr device gateway source <<< "$record"
             if ! owned_route_present "$cidr" "$device" "$gateway" "$source"; then
@@ -420,6 +603,12 @@ main() {
         [[ $(ip -N -4 -o route show table main default) == "$(printf '%s\n' "$routes" | grep '^default ' || true)" ]] || fail 'Default route changed during apply; inspect concurrent network configuration.'
         printf 'Apply complete. Journal: %s\n' "$state_file"
     elif [[ $mode == verify ]]; then
+        if $persist || [[ -f $state_dir/networkmanager ]]; then
+            for record in "${persistent_plan[@]}"; do
+                IFS='|' read -r index cidr device gateway source <<< "$record"
+                [[ $(saved_route_status "$index" "$cidr" "$gateway" "$source") == present ]] || fail "Persistent route is not saved as planned: $cidr"
+            done
+        fi
         for record in "${plan[@]}"; do
             IFS='|' read -r cidr device gateway source <<< "$record"
             owned_route_present "$cidr" "$device" "$gateway" "$source" || fail "Owned route not installed as planned: $cidr"
