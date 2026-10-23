@@ -228,7 +228,7 @@ build_plan() {
                 fail "Existing route collision for $cidr: $line"
             fi
             if (( ${destination#*/} > ${cidr#*/} )) && contains "$cidr" "${destination%/*}"; then
-                if [[ $line == *' scope link '* && $(route_field "$line" dev) == "$device" && $allow_connected == true ]]; then
+                if [[ $(route_field "$line" scope) =~ ^(link|253)$ && $(route_field "$line" dev) == "$device" && $allow_connected == true ]]; then
                     warn "More-specific connected route stays direct: $line"
                 else
                     fail "More-specific route overrides $cidr: $line (same-NIC connected routes require --allow-connected-overlap)."
