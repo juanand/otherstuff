@@ -5,17 +5,21 @@ export LC_ALL=C
 simple_fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 simple_root() { ((EUID == 0)) || simple_fail 'Root is required for --apply.'; }
 simple_usage() {
-    printf 'Usage: bash %s [--apply] [--persist] --map NIC_CIDR=DEST1[,DEST2] ...\n' "${0##*/}"
+    printf 'Usage: bash %s [--apply] [--persist] [--metric NUMBER] --map NIC_CIDR=DEST1[,DEST2] ...\n' "${0##*/}"
+    printf '       bash %s --rollback [--metric NUMBER] [--apply]\n' "${0##*/}"
     printf '       bash %s --reset [--apply]\n' "${0##*/}"
     printf '%s\n' \
         'Azure Linux IPv4 routes. Default: read-only preview.' \
         '  --map NIC_CIDR=DEST1,DEST2  Repeatable; unmatched NIC subnets warn and skip.' \
         '    Example: --map 10.0.0.0/16=10.0.0.0/8,172.20.0.0/16' \
         '  --gateway NIC_CIDR=IP      Optional subnet-gateway override; repeatable.' \
-        '  --apply                    Add the reviewed routes; root required.' \
+        '  --apply                    Perform reviewed route changes; root required.' \
         '  --persist                  With --apply, also save NetworkManager routes.' \
-        '  --reset                    Preview deletion/reconnection of active managed Ethernet profiles.' \
-        '    With --apply: DISRUPTIVE. Custom profile settings are lost. Use a console.' \
+        '  --metric NUMBER            Positive IPv4 route metric; default 42762.' \
+        '  --rollback                 Remove custom routes with the selected metric.' \
+        '  --reset                    Remove custom routes with any metric.' \
+        '    Cleanup includes saved routes on active managed Ethernet NICs; defaults stay.' \
+        '    No profile deletion/reactivation. Use a console for cleanup --apply.' \
         '  --help                     Show this help.'
 }
 
@@ -185,7 +189,7 @@ simple_live() {
     if [[ -z $line ]]; then printf 'absent\n'; return; fi
     [[ $line != *$'\n'* && $line != *nexthop* && $(simple_field "$line" dev) == "$device" ]] || simple_fail "Route collision for $cidr."
     if [[ -z $(simple_field "$line" via) && $(simple_field "$line" scope) =~ ^(link|253)$ ]]; then printf 'direct\n'; return; fi
-    [[ $(simple_field "$line" via) == "$gateway" && $(simple_field "$line" src) == "$source" && $(simple_field "$line" metric) == 42762 && $(simple_field "$line" proto) =~ ^(4|static)$ ]] || simple_fail "Conflicting route for $cidr; inspect or reset first."
+    [[ $(simple_field "$line" via) == "$gateway" && $(simple_field "$line" src) == "$source" && $(simple_field "$line" metric) == "$simple_metric" && $(simple_field "$line" proto) =~ ^(4|static)$ ]] || simple_fail "Conflicting route for $cidr; inspect or reset first."
     printf 'present\n'
 }
 simple_saved() {
@@ -199,7 +203,7 @@ simple_saved() {
         read -r -a fields <<< "$entry"; ((${#fields[@]})) || continue
         simple_cidr "${fields[0]}" >/dev/null || simple_fail 'Unsupported nmcli route output.'
         [[ ${fields[0]} == "$cidr" ]] || continue
-        [[ ${#fields[@]} == 5 && ${fields[1]} == "$gateway" && ${fields[2]} == 42762 && ( "${fields[3]} ${fields[4]}" == "src=$source table=254" || "${fields[3]} ${fields[4]}" == "table=254 src=$source" ) ]] || simple_fail "Saved route collision for $cidr."
+        [[ ${#fields[@]} == 5 && ${fields[1]} == "$gateway" && ${fields[2]} == "$simple_metric" && ( "${fields[3]} ${fields[4]}" == "src=$source table=254" || "${fields[3]} ${fields[4]}" == "table=254 src=$source" ) ]] || simple_fail "Saved route collision for $cidr."
         count=$((count+1))
     done
     ((count <= 1)) || simple_fail 'Duplicate saved routes require manual cleanup.'
@@ -267,7 +271,7 @@ simple_plan() {
                 fi
             fi
             simple_plan_rows+=("$record")
-            printf 'MAP %s -> %s source=%s gateway=%s evidence=%s profile=%s\n' "$destination" "$device" "${simple_addresses[selected]}" "$gateway" "$evidence" "$uuid"
+            printf 'MAP %s -> %s source=%s gateway=%s evidence=%s profile=%s metric=%s\n' "$destination" "$device" "${simple_addresses[selected]}" "$gateway" "$evidence" "$uuid" "$simple_metric"
         done
     done
 }
@@ -277,71 +281,139 @@ simple_add() {
         IFS='|' read -r cidr device gateway source uuid <<< "$record"
         if [[ $uuid != - ]]; then
             status=$(simple_saved "$record") || simple_fail 'Saved routes changed during apply.'
-            if [[ $status == absent ]]; then nmcli connection modify uuid "$uuid" +ipv4.routes "$cidr $gateway 42762 src=$source table=254" || simple_fail 'Saving failed; partial changes may remain.'; fi
+            if [[ $status == absent ]]; then nmcli connection modify uuid "$uuid" +ipv4.routes "$cidr $gateway $simple_metric src=$source table=254" || simple_fail 'Saving failed; partial changes may remain.'; fi
             [[ $(simple_saved "$record") == present ]] || simple_fail 'Saved route verification failed.'
         fi
         status=$(simple_live "$record") || simple_fail 'Runtime routes changed during apply.'
-        if [[ $status == absent ]]; then ip -4 route add "$cidr" via "$gateway" dev "$device" src "$source" proto static metric 42762 || simple_fail 'Route addition failed; partial changes may remain.'; fi
+        if [[ $status == absent ]]; then ip -4 route add "$cidr" via "$gateway" dev "$device" src "$source" proto static metric "$simple_metric" || simple_fail 'Route addition failed; partial changes may remain.'; fi
         [[ $(simple_live "$record") == present ]] || simple_fail 'Runtime route verification failed.'
     done
     [[ $(ip -N -4 -o route show table main default) == "$(printf '%s\n' "$simple_routes" | grep '^default ' || true)" ]] || simple_fail 'Default routes changed; inspect concurrent configuration.'
     printf 'Applied. Persistence=%s. No profiles were reactivated.\n' "$simple_persist"
 }
-simple_reset() {
-    local output device type state uuid previous record line cidr gateway source
-    local -a targets=() uuids=()
-    command -v nmcli >/dev/null || simple_fail '--reset requires NetworkManager and nmcli.'
+simple_profile_routes() {
+    local raw
+    raw=$(nmcli --escape no -g ipv4.routes connection show uuid "$1") || simple_fail 'Cannot inspect saved routes.'
+    [[ $raw != -- ]] || raw=''
+    printf '%s\n' "${raw//$'\n'/,}"
+}
+simple_cleanup() {
+    local mode=$1 output device type state uuid previous raw entry cidr metric table profile_table attribute route_type line protocol gateway source index current
+    local -a targets=() uuids=() snapshots=() saved_rows=() live_rows=() entries=() fields=() arguments=()
+    command -v nmcli >/dev/null || simple_fail 'Route cleanup requires active NetworkManager and nmcli.'
+    simple_inventory
     output=$(nmcli --terse --escape no -f DEVICE,TYPE,STATE device status) || simple_fail 'Cannot list NetworkManager devices.'
     while IFS=: read -r device type state; do
         [[ $type == ethernet && $state == connected* ]] || continue
-        [[ $device =~ ^[a-zA-Z0-9_.:-]+$ ]] || simple_fail 'Unsupported reset device.'
-        uuid=$(nmcli --escape no -g GENERAL.CON-UUID device show "$device") || simple_fail 'Cannot inspect reset profile.'
-        [[ $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || simple_fail 'No unique active reset profile.'
-        for previous in "${uuids[@]}"; do [[ $previous != "$uuid" ]] || simple_fail 'Reset profile is shared by multiple devices.'; done
+        [[ $device =~ ^[a-zA-Z0-9_.:-]+$ ]] || simple_fail 'Unsupported cleanup device.'
+        uuid=$(nmcli --escape no -g GENERAL.CON-UUID device show "$device") || simple_fail 'Cannot inspect active profile.'
+        [[ $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || simple_fail 'No unique active cleanup profile.'
+        for previous in "${uuids[@]}"; do [[ $previous != "$uuid" ]] || simple_fail 'Cleanup profile is shared by multiple devices.'; done
         targets+=("$device"); uuids+=("$uuid")
-        printf 'RESET %s: delete active profile %s, then reconnect device.\n' "$device" "$uuid"
+        profile_table=$(nmcli --escape no -g ipv4.route-table connection show uuid "$uuid") || simple_fail 'Cannot inspect profile route table.'
+        [[ $profile_table =~ ^[0-9]+$ ]] || simple_fail 'Unsupported profile route table.'
+        [[ $profile_table != 0 ]] || profile_table=254
+        raw=$(simple_profile_routes "$uuid") || simple_fail 'Cannot plan saved route removal.'
+        snapshots+=("$raw"); entries=()
+        IFS=, read -r -a entries <<< "$raw"
+        for entry in "${entries[@]}"; do
+            read -r entry <<< "$entry"; read -r -a fields <<< "$entry"
+            ((${#fields[@]})) || continue
+            cidr=${fields[0]}; simple_cidr "$cidr" >/dev/null || simple_fail 'Unsupported saved route output.'
+            [[ ${cidr#*/} != 0 ]] || continue
+            metric=${fields[2]:--1}; table=$profile_table; route_type=unicast
+            [[ $metric =~ ^(-1|[0-9]+)$ ]] || simple_fail 'Unsupported saved route metric.'
+            for attribute in "${fields[@]:3}"; do
+                case $attribute in
+                    table=*) [[ ${attribute#*=} == 0 ]] || table=${attribute#*=} ;;
+                    type=*) route_type=${attribute#*=} ;;
+                esac
+            done
+            [[ $table == 254 && $route_type == unicast ]] || continue
+            [[ $mode != rollback || $metric == "$simple_metric" ]] || continue
+            saved_rows+=("$uuid|$entry")
+            printf 'REMOVE saved device=%s profile=%s route=%s\n' "$device" "$uuid" "$entry"
+        done
     done <<< "$output"
-    ((${#targets[@]})) || simple_fail 'No active managed Ethernet profiles to reset.'
-    printf 'WARNING: Reset disconnects these NICs and deletes their active profiles, including custom settings. Use Serial Console.\n'
-    $simple_apply || { printf 'DRY RUN: No changes. Add --apply to perform this disruptive reset.\n'; return; }
-    [[ -z ${SSH_CONNECTION:-} ]] || simple_fail 'Reset must be run from a console, not an SSH session.'
-    output=$(ip -N -4 -o route show table main) || simple_fail 'Cannot inspect routes before reset.'
-    for record in "${!targets[@]}"; do
-        device=${targets[record]}; uuid=${uuids[record]}
-        while IFS= read -r line; do
-            [[ $line != default\ * && $(simple_field "$line" dev) == "$device" && $(simple_field "$line" metric) == 42762 && $(simple_field "$line" proto) =~ ^(4|static)$ ]] || continue
-            cidr=${line%% *}; gateway=$(simple_field "$line" via); source=$(simple_field "$line" src)
-            [[ -n $gateway && -n $source ]] || simple_fail 'Unexpected metric-tagged route; inspect manually.'
-            ip -4 route del "$cidr" via "$gateway" dev "$device" src "$source" proto static metric 42762 || simple_fail 'Runtime route removal failed; reset is incomplete.'
-        done <<< "$output"
-        nmcli connection delete uuid "$uuid" || simple_fail 'Profile deletion failed; reset is incomplete.'
-        nmcli device connect "$device" || simple_fail 'Device reconnect failed; recover from the console.'
+    ((${#targets[@]})) || simple_fail 'No active managed Ethernet profiles to inspect.'
+    while IFS= read -r line; do
+        [[ -n $line && $line != default\ * && $line != 0.0.0.0/0\ * ]] || continue
+        device=$(simple_field "$line" dev); protocol=$(simple_field "$line" proto)
+        [[ " ${targets[*]} " == *" $device "* && -n $device && $protocol =~ ^(4|static|3|boot)$ ]] || continue
+        metric=$(simple_field "$line" metric); metric=${metric:-0}
+        [[ $mode != rollback || $metric == "$simple_metric" ]] || continue
+        [[ $line != *nexthop* && $metric =~ ^[0-9]+$ ]] || simple_fail 'Multipath or unsupported custom route requires manual review.'
+        cidr=${line%% *}; [[ $cidr == */* ]] || cidr+='/32'
+        simple_cidr "$cidr" >/dev/null || simple_fail 'Unsupported custom route destination.'
+        live_rows+=("$line")
+        printf 'REMOVE live %s\n' "$line"
+    done <<< "$simple_routes"
+    if ((${#saved_rows[@]} == 0 && ${#live_rows[@]} == 0)); then printf 'No matching custom routes. No changes made.\n'; return; fi
+    printf 'WARNING: Route removal can interrupt connectivity. Defaults and connected routes are retained; use a console.\n'
+    $simple_apply || { printf 'DRY RUN: No changes. Add --apply to remove these routes.\n'; return; }
+    [[ -z ${SSH_CONNECTION:-} ]] || simple_fail 'Route cleanup must be run from a console, not an SSH session.'
+    current=$(ip -N -4 -o route show table main) || simple_fail 'Cannot recheck routes before removal.'
+    [[ $current == "$simple_routes" ]] || simple_fail 'Routes changed during planning; rerun the preview.'
+    for index in "${!uuids[@]}"; do
+        current=$(simple_profile_routes "${uuids[index]}") || simple_fail 'Cannot recheck saved routes before removal.'
+        [[ $current == "${snapshots[index]}" ]] || simple_fail 'Saved routes changed during planning; rerun the preview.'
     done
-    printf 'Reset completed. Verify addresses, default routes and connectivity; other compatible profiles may have been reused.\n'
+    for entry in "${saved_rows[@]}"; do
+        uuid=${entry%%|*}; entry=${entry#*|}
+        nmcli connection modify uuid "$uuid" -ipv4.routes "$entry" || simple_fail 'Saved route removal failed; partial changes may remain.'
+        raw=$(simple_profile_routes "$uuid") || simple_fail 'Cannot verify saved route removal.'
+        entries=(); IFS=, read -r -a entries <<< "$raw"
+        for current in "${entries[@]}"; do
+            read -r current <<< "$current"
+            [[ $current != "$entry" ]] || simple_fail 'Saved route removal verification failed.'
+        done
+    done
+    for line in "${live_rows[@]}"; do
+        cidr=${line%% *}; device=$(simple_field "$line" dev); protocol=$(simple_field "$line" proto)
+        gateway=$(simple_field "$line" via); source=$(simple_field "$line" src); metric=$(simple_field "$line" metric)
+        arguments=(-4 route del "$cidr" table main proto "$protocol" dev "$device" metric "${metric:-0}")
+        [[ -z $gateway ]] || arguments+=(via "$gateway")
+        [[ -z $source ]] || arguments+=(src "$source")
+        ip "${arguments[@]}" || simple_fail 'Live route removal failed; partial changes may remain.'
+    done
+    output=$(ip -N -4 -o route show table main) || simple_fail 'Cannot verify remaining routes.'
+    for line in "${live_rows[@]}"; do
+        [[ $'\n'"$output"$'\n' != *$'\n'"$line"$'\n'* ]] || simple_fail 'Live route removal verification failed.'
+    done
+    [[ $(printf '%s\n' "$output" | grep '^default ' || true) == "$(printf '%s\n' "$simple_routes" | grep '^default ' || true)" ]] || simple_fail 'Default routes changed; inspect concurrent configuration.'
+    printf '%s completed. Only custom route entries were removed; no profiles were reactivated.\n' "$mode"
 }
 simple_main() {
-    local arg reset=false record selected evidence
-    simple_apply=false; simple_persist=false; simple_maps=(); simple_overrides=()
+    local arg operation='' metric_explicit=false record selected evidence
+    simple_apply=false; simple_persist=false; simple_metric=42762; simple_maps=(); simple_overrides=()
     while (($#)); do
         arg=$1; shift
         case $arg in
             --help|-h) simple_usage; return ;;
             --apply) simple_apply=true ;;
             --persist) simple_persist=true ;;
-            --reset) reset=true ;;
-            --map|--gateway)
+            --reset|--rollback)
+                [[ -z $operation ]] || simple_fail 'Choose only one of --rollback or --reset.'
+                operation=${arg#--} ;;
+            --map|--gateway|--metric)
                 (($#)) && [[ -n $1 && $1 != --* ]] || simple_fail "Missing argument for $arg"
-                if [[ $arg == --map ]]; then simple_maps+=("$1"); else simple_overrides+=("$1"); fi
+                case $arg in
+                    --map) simple_maps+=("$1") ;;
+                    --gateway) simple_overrides+=("$1") ;;
+                    --metric) simple_metric=$1; metric_explicit=true ;;
+                esac
                 shift ;;
             *) simple_fail "Unknown argument: $arg" ;;
         esac
     done
+    [[ $simple_metric =~ ^[1-9][0-9]{0,9}$ ]] && ((10#$simple_metric <= 4294967295)) || simple_fail '--metric must be an integer from 1 through 4294967295.'
     simple_check_os
     command -v ip >/dev/null || simple_fail 'iproute2 is required.'
     if $simple_apply; then simple_root; fi
-    if $reset; then
-        ((${#simple_maps[@]} == 0 && ${#simple_overrides[@]} == 0)) && ! $simple_persist || simple_fail '--reset is separate from maps, gateway overrides and --persist.'
-        simple_reset; return
+    if [[ -n $operation ]]; then
+        ((${#simple_maps[@]} == 0 && ${#simple_overrides[@]} == 0)) && ! $simple_persist || simple_fail 'Cleanup is separate from maps, gateway overrides and --persist; saved routes are included automatically.'
+        [[ $operation != reset ]] || ! $metric_explicit || simple_fail '--reset removes all custom metrics; use --metric with --rollback instead.'
+        simple_cleanup "$operation"; return
     fi
     ((${#simple_maps[@]})) || simple_fail 'Supply at least one --map.'
     simple_inventory
