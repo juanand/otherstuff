@@ -1,5 +1,90 @@
+<#
+.SYNOPSIS
+Configures IPv4 destination routes for Azure VMs with multiple NICs.
+
+.DESCRIPTION
+Previews subnet-to-destination mappings and changes routes only with -Apply.
+Unmatched NIC maps warn and skip; invalid or ambiguous configuration fails before
+mutation. Default, connected, and DHCP-learned routes are preserved.
+
+Use named PowerShell parameters with a single hyphen. Supply -Map once with an
+array of quoted mappings; Bash-style --map and repeated -Map parameters are not
+supported. Destination routes do not guarantee symmetric replies for every source.
+
+.PARAMETER Map
+An array of NIC_CIDR=DEST1,DEST2 strings. The selector must contain one actual NIC
+subnet. The destinations are canonical non-default IPv4 networks.
+
+.PARAMETER Gateway
+An array of NIC_CIDR=ACTUAL_GATEWAY overrides. Overrides take precedence over OS
+discovery. Missing Windows gateway evidence requires an override, not calculation.
+
+.PARAMETER Metric
+Route metric from 1 through 65535. Default: 42762. Used for additions and rollback.
+
+.PARAMETER Apply
+Performs the reviewed additions or cleanup. Requires an elevated Administrator
+session. Without this switch, all operations are read-only previews.
+
+.PARAMETER Persist
+With -Apply, saves new routes in both native active and persistent stores.
+An existing active-only route requires reviewed rollback before persistent apply.
+Without -Apply this is still a preview. Not used with rollback or reset.
+
+.PARAMETER Rollback
+Removes eligible manual routes using the selected metric from saved and active
+stores. Preview by default; add -Apply from a console to perform removal.
+
+.PARAMETER Reset
+Removes eligible manual routes across all metrics from saved and active stores.
+Does not delete profiles or change DNS, MTU, addresses, or DHCP settings. Cannot be
+combined with -Metric, -Map, -Gateway, -Persist, or -Rollback. Preview by default.
+
+.PARAMETER Help
+Displays the same detailed help as Get-Help -Full without inspecting networking.
+
+.PARAMETER InventoryPath
+Reads an explicit JSON fixture with Interfaces, Routes, and SavedRoutes for an
+offline preview. Cannot be combined with -Apply.
+
+.PARAMETER LibraryOnly
+Loads functions without discovery or mutation. Intended for the isolated tests.
+
+.EXAMPLE
+$maps = @('10.0.0.0/8=10.0.0.0/8,172.20.0.0/16', '172.16.0.0/16=172.16.0.0/16')
+& $tool -Map $maps
+
+Previews multiple mappings. In these examples, set $tool to the actual path of this
+script. A comma inside one quoted mapping separates destinations for the same NIC.
+
+.EXAMPLE
+& $tool -Map '172.16.0.0/16=172.16.0.0/16' -Gateway '172.16.0.0/16=172.16.0.126' -Apply -Persist -Metric 50000
+
+Adds and saves a route with an explicit gateway and custom metric. Run the same
+command without -Apply to preview first.
+
+.EXAMPLE
+& $tool -Rollback -Metric 50000
+& $tool -Rollback -Metric 50000 -Apply
+
+Previews and then removes eligible routes using metric 50000, including saved ones.
+
+.EXAMPLE
+& $tool -Reset
+& $tool -Reset -Apply
+
+Previews and then removes eligible manual routes across metrics. Use a console;
+removing routes can interrupt remote access even when defaults are retained.
+
+.NOTES
+Supports Windows PowerShell 5.1 and PowerShell 7 with installed OS networking
+cmdlets. No dependencies are installed. Batches are not atomic; partial changes
+may remain after failure. Verify source-bound traffic in both directions.
+#>
+
 #requires -Version 5.1
-[CmdletBinding()]
+
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string[]] $Map = @(),
     [string[]] $Gateway = @(),
@@ -15,24 +100,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:InvocationName = [System.IO.Path]::GetFileName($PSCommandPath)
+$script:HelpPath = $PSCommandPath
 
 function Show-MultiNicHelp {
-    Write-Output @"
-Usage: .\$script:InvocationName -Map 'NIC_CIDR=DEST1,DEST2',... [-Apply] [-Persist] [-Metric NUMBER]
-       .\$script:InvocationName -Rollback [-Metric NUMBER] [-Apply]
-       .\$script:InvocationName -Reset [-Apply]
-Azure Windows IPv4 routes. Default: read-only preview. Windows PowerShell 5.1 / PowerShell 7.
-  -Map       Subnet-to-destination mappings; unmatched NIC subnets warn and skip.
-  -Gateway   Optional NIC_CIDR=ACTUAL_GATEWAY overrides; no gateway calculation.
-  -Apply     Perform reviewed route changes; Administrator required.
-  -Persist   Save additions across reboots. Without -Apply this is still a preview.
-  -Metric    Route metric from 1 through 65535; default 42762.
-  -Rollback  Remove manual routes using the selected metric, including saved routes.
-  -Reset     Remove manual routes across all metrics, including saved routes.
-  -Help      Show this help without inspecting networking.
-Cleanup retains defaults, connected/DHCP routes, and other network settings. Use a console.
-"@
+        Get-Help -Name $script:HelpPath -Full
 }
 
 function Test-MultiNicWindows {
