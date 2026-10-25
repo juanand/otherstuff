@@ -17,7 +17,9 @@ subnet. The destinations are canonical non-default IPv4 networks.
 
 .PARAMETER Gateway
 An array of NIC_CIDR=ACTUAL_GATEWAY overrides. Overrides take precedence over OS
-discovery. Missing Windows gateway evidence requires an override, not calculation.
+discovery. Only when evidence is absent, Azure gateways are calculated as the actual
+subnet network plus one for /2 through /29 and labelled in the plan. Conflicting or
+invalid evidence and unsupported calculation prefixes require an explicit override.
 
 .PARAMETER Metric
 Route metric from 1 through 65535. Default: 42762. Used for additions and rollback.
@@ -236,15 +238,23 @@ function Get-MultiNicGateway {
             if ($resolved.Index -eq $Interface.Index) { $parts[1] }
         }
     )
+    $prefix = Get-IPv4Prefix "$($Interface.Address)/$($Interface.PrefixLength)"
     if ($explicit.Count -gt 1) { throw "Duplicate gateway overrides for $($Interface.Alias)." }
     if ($explicit.Count) { $gatewayAddress = $explicit[0]; $evidence = 'override' }
     else {
         $candidates = @($Interface.Gateways | Select-Object -ExpandProperty Address -Unique)
-        if ($candidates.Count -ne 1) { throw "Missing/conflicting gateway evidence for $($Interface.Alias); supply -Gateway NIC_CIDR=ACTUAL_GATEWAY." }
-        $gatewayAddress = $candidates[0]
-        $evidence = @($Interface.Gateways | Select-Object -ExpandProperty Evidence -Unique) -join ','
+        if ($candidates.Count -gt 1) { throw "Conflicting gateway evidence for $($Interface.Alias); supply -Gateway NIC_CIDR=ACTUAL_GATEWAY." }
+        if ($candidates.Count -eq 1) {
+            $gatewayAddress = $candidates[0]
+            $evidence = @($Interface.Gateways | Select-Object -ExpandProperty Evidence -Unique) -join ','
+        }
+        else {
+            if ($prefix.Length -lt 2 -or $prefix.Length -gt 29) { throw "Cannot calculate an Azure gateway for $($Interface.Address)/$($prefix.Length); supply -Gateway NIC_CIDR=ACTUAL_GATEWAY." }
+            [long] $gatewayNumber = $prefix.Network + 1
+            $gatewayAddress = '{0}.{1}.{2}.{3}' -f (($gatewayNumber -shr 24) -band 255), (($gatewayNumber -shr 16) -band 255), (($gatewayNumber -shr 8) -band 255), ($gatewayNumber -band 255)
+            $evidence = "Azure-subnet-plus-one($($Interface.Address)/$($prefix.Length))"
+        }
     }
-    $prefix = Get-IPv4Prefix "$($Interface.Address)/$($Interface.PrefixLength)"
     $number = ConvertTo-IPv4Number $gatewayAddress
     if (($number -band $prefix.Mask) -ne $prefix.Network) { throw 'Gateway is outside the actual NIC subnet.' }
     if (@($Inventory.Interfaces | Where-Object Address -eq $gatewayAddress).Count) { throw 'Gateway is a local address.' }
@@ -379,7 +389,8 @@ function Invoke-MultiNicRouting {
     $inventory.Interfaces | Format-Table Index, Alias, Mac, Address, PrefixLength | Out-Host
     $records = @(if ($Cleanup) { New-MultiNicCleanupPlan $inventory $Cleanup $Metric } else { New-MultiNicPlan $inventory $Mappings $Overrides $Metric -Persist:$Persist })
     if (-not $records.Count) { Write-Host 'No matching route changes. No changes made.'; return }
-    $records | Format-Table | Out-Host
+    if ($Cleanup) { $records | Format-Table Store, Destination, Index, Gateway, Metric -AutoSize -Wrap | Out-Host }
+    else { $records | Format-Table Destination, Alias, Source, Gateway, Metric, Evidence -AutoSize -Wrap | Out-Host }
     Write-Warning 'Destination routes do not guarantee arbitrary-source reply symmetry. Verify source-bound traffic and Azure/guest firewall prerequisites.'
     if (-not $Apply) { Write-Host 'DRY RUN: No changes. Add -Apply after reviewing the plan.'; return $records }
     if ($Cleanup -and $env:SSH_CONNECTION) { throw 'Route cleanup must be run from a console, not an SSH session.' }
