@@ -8,8 +8,8 @@ simple_usage() {
     printf 'Usage: bash %s [--apply] [--persist] --map NIC_CIDR=DEST1[,DEST2] ...\n' "${0##*/}"
     printf '       bash %s --reset [--apply]\n' "${0##*/}"
     printf '%s\n' \
-        'Azure Linux IPv4 routes. Default: read-only preview. No journal files.' \
-        '  --map NIC_CIDR=DEST1,DEST2  Repeatable; select one actual NIC subnet.' \
+        'Azure Linux IPv4 routes. Default: read-only preview.' \
+        '  --map NIC_CIDR=DEST1,DEST2  Repeatable; unmatched NIC subnets warn and skip.' \
         '    Example: --map 10.0.0.0/16=10.0.0.0/8,172.20.0.0/16' \
         '  --gateway NIC_CIDR=IP      Optional subnet-gateway override; repeatable.' \
         '  --apply                    Add the reviewed routes; root required.' \
@@ -84,7 +84,7 @@ simple_select() {
             selected=$index
         fi
     done
-    ((selected >= 0)) || simple_fail "No actual NIC subnet matches $selector."
+    ((selected >= 0)) || return 2
     printf '%s\n' "$selected"
 }
 simple_inventory() {
@@ -216,10 +216,7 @@ simple_plan() {
         for previous in "${selectors[@]}"; do
             if simple_contains "$selector" "${previous%/*}" || simple_contains "$previous" "${selector%/*}"; then simple_fail 'Overlapping NIC selectors.'; fi
         done
-        selectors+=("$selector"); selected=$(simple_select "$selector") || simple_fail 'Cannot select NIC.'
-        device=${simple_devices[selected]}; evidence=$(simple_gateway "$selected") || simple_fail 'Cannot establish gateway.'
-        gateway=${evidence%%|*}; evidence=${evidence#*|}; uuid=-
-        if $simple_persist; then uuid=$(simple_profile "$device") || simple_fail 'Cannot establish persistent profile.'; fi
+        selectors+=("$selector")
         IFS=, read -r -a destination_list <<< "$destinations"
         for destination in "${destination_list[@]}"; do
             simple_canonical "$destination"
@@ -227,6 +224,19 @@ simple_plan() {
                 if simple_contains "$destination" "${previous%/*}" || simple_contains "$previous" "${destination%/*}"; then simple_fail 'Overlapping destination mappings.'; fi
             done
             all_destinations+=("$destination")
+        done
+        if selected=$(simple_select "$selector"); then
+            :
+        else
+            status=$?
+            [[ $status == 2 ]] || simple_fail 'Cannot select NIC.'
+            printf 'WARNING: No actual NIC subnet matches %s; skipping map %s.\n' "$selector" "$group" >&2
+            continue
+        fi
+        device=${simple_devices[selected]}; evidence=$(simple_gateway "$selected") || simple_fail 'Cannot establish gateway.'
+        gateway=${evidence%%|*}; evidence=${evidence#*|}; uuid=-
+        if $simple_persist; then uuid=$(simple_profile "$device") || simple_fail 'Cannot establish persistent profile.'; fi
+        for destination in "${destination_list[@]}"; do
             for index in "${!simple_addresses[@]}"; do
                 if [[ ${simple_devices[index]} != "$device" ]] && simple_contains "$destination" "${simple_addresses[index]%/*}"; then simple_fail 'Destination contains another local NIC.'; fi
             done
@@ -275,7 +285,7 @@ simple_add() {
         [[ $(simple_live "$record") == present ]] || simple_fail 'Runtime route verification failed.'
     done
     [[ $(ip -N -4 -o route show table main default) == "$(printf '%s\n' "$simple_routes" | grep '^default ' || true)" ]] || simple_fail 'Default routes changed; inspect concurrent configuration.'
-    printf 'Applied. Persistence=%s. No profiles were reactivated; no journal was written.\n' "$simple_persist"
+    printf 'Applied. Persistence=%s. No profiles were reactivated.\n' "$simple_persist"
 }
 simple_reset() {
     local output device type state uuid previous record line cidr gateway source
@@ -341,6 +351,10 @@ simple_main() {
         evidence=$(simple_gateway "$selected") || simple_fail 'Invalid gateway override.'
     done
     simple_plan
+    if ((${#simple_plan_rows[@]} == 0)); then
+        printf 'No route additions needed. No changes made.\n'
+        return
+    fi
     printf 'Azure connectivity, NSGs/firewalls and symmetric reply routing remain separate prerequisites.\n'
     if $simple_apply; then simple_add
     else printf 'DRY RUN: No changes. Add --apply for runtime routes; add --apply --persist to save them.\n'; fi
