@@ -19,6 +19,24 @@ simple_usage() {
         '  --help                     Show this help.'
 }
 
+simple_os_release() (
+    local release_file=${1:-/etc/os-release} ID='' ID_LIKE=''
+    [[ -f $release_file && -r $release_file ]] || simple_fail 'Cannot read OS metadata.'
+    . "$release_file" || simple_fail 'Cannot load OS metadata.'
+    [[ -n $ID ]] || simple_fail 'OS metadata has no ID.'
+    printf '%s\n' "$ID" "$ID_LIKE"
+)
+simple_check_os() {
+    local metadata family
+    local -a families=()
+    metadata=$(simple_os_release) || simple_fail 'Cannot determine OS family; requires a RHEL/Fedora-derived distribution.'
+    read -r -a families <<< "${metadata//$'\n'/ }"
+    for family in "${families[@]}"; do
+        case $family in rhel|centos|fedora|rocky|almalinux|ol) return ;; esac
+    done
+    simple_fail "Unsupported OS family: ${metadata//$'\n'/ }. Requires a RHEL/Fedora-derived distribution."
+}
+
 simple_number() {
     local address=$1 octet number=0
     local -a octets=()
@@ -308,6 +326,7 @@ simple_main() {
             *) simple_fail "Unknown argument: $arg" ;;
         esac
     done
+    simple_check_os
     command -v ip >/dev/null || simple_fail 'iproute2 is required.'
     if $simple_apply; then simple_root; fi
     if $reset; then
