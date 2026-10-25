@@ -40,9 +40,6 @@ Removes eligible manual routes across all metrics from saved and active stores.
 Does not delete profiles or change DNS, MTU, addresses, or DHCP settings. Cannot be
 combined with -Metric, -Map, -Gateway, -Persist, or -Rollback. Preview by default.
 
-.PARAMETER Help
-Displays the same detailed help as Get-Help -Full without inspecting networking.
-
 .PARAMETER InventoryPath
 Reads an explicit JSON fixture with Interfaces, Routes, and SavedRoutes for an
 offline preview. Cannot be combined with -Apply.
@@ -93,18 +90,12 @@ param(
     [switch] $Persist,
     [switch] $Rollback,
     [switch] $Reset,
-    [switch] $Help,
     [string] $InventoryPath,
     [switch] $LibraryOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:HelpPath = $PSCommandPath
-
-function Show-MultiNicHelp {
-        Get-Help -Name $script:HelpPath -Full
-}
 
 function Test-MultiNicWindows {
     return ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
@@ -162,7 +153,14 @@ function Test-IPv4Contains {
 
 function Get-MultiNicRoutes {
     param([ValidateSet('ActiveStore', 'PersistentStore')] [string] $Store)
-    foreach ($route in @(Get-NetRoute -AddressFamily IPv4 -PolicyStore $Store -ErrorAction Stop)) {
+    try {
+        $routes = @(Get-NetRoute -AddressFamily IPv4 -PolicyStore $Store -ErrorAction Stop)
+    }
+    catch {
+        if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound -and $_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound*') { return }
+        throw
+    }
+    foreach ($route in $routes) {
         [pscustomobject]@{
             Destination = [string] $route.DestinationPrefix; Index = [int] $route.InterfaceIndex
             Gateway = [string] $route.NextHop; Metric = [int] $route.RouteMetric; Protocol = [string] $route.Protocol
@@ -402,7 +400,6 @@ function Invoke-MultiNicRouting {
 }
 
 if (-not $LibraryOnly) {
-    if ($Help) { Show-MultiNicHelp; return }
     if ($Rollback -and $Reset) { throw 'Choose only one of -Rollback or -Reset.' }
     if ($Reset -and $PSBoundParameters.ContainsKey('Metric')) { throw '-Reset covers all custom metrics; use -Metric with -Rollback instead.' }
     $cleanupMode = if ($Rollback) { 'Rollback' } elseif ($Reset) { 'Reset' } else { '' }
