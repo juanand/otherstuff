@@ -183,19 +183,33 @@ simple_profile() {
     printf '%s\n' "$uuid"
 }
 simple_live() {
-    local cidr device gateway source uuid line
+    local cidr device gateway source uuid line preferred
     IFS='|' read -r cidr device gateway source uuid <<< "$1"
     line=$(ip -N -4 -o route show table main exact "$cidr") || simple_fail 'Cannot inspect route.'
     if [[ -z $line ]]; then printf 'absent\n'; return; fi
     [[ $line != *$'\n'* && $line != *nexthop* && $(simple_field "$line" dev) == "$device" ]] || simple_fail "Route collision for $cidr."
     if [[ -z $(simple_field "$line" via) && $(simple_field "$line" scope) =~ ^(link|253)$ ]]; then printf 'direct\n'; return; fi
-    [[ $(simple_field "$line" via) == "$gateway" && $(simple_field "$line" src) == "$source" && $(simple_field "$line" metric) == "$simple_metric" && $(simple_field "$line" proto) =~ ^(4|static)$ ]] || simple_fail "Conflicting route for $cidr; inspect or reset first."
+    preferred=$(simple_field "$line" src)
+    [[ $(simple_field "$line" via) == "$gateway" && ( -z $preferred || $preferred == "$source" ) && $(simple_field "$line" metric) == "$simple_metric" && $(simple_field "$line" proto) =~ ^(4|static)$ ]] || simple_fail "Conflicting route for $cidr; inspect or reset first."
     printf 'present\n'
 }
+simple_saved_spec() {
+    local cidr device gateway source uuid method spec
+    IFS='|' read -r cidr device gateway source uuid <<< "$1"
+    method=$(nmcli --escape no -g ipv4.method connection show uuid "$uuid") || simple_fail 'Cannot read profile IPv4 method.'
+    spec="$cidr $gateway $simple_metric"
+    case $method in
+        auto) ;;
+        manual) spec+=" src=$source" ;;
+        *) simple_fail 'Persistence requires an auto or manual IPv4 profile.' ;;
+    esac
+    printf '%s table=254\n' "$spec"
+}
 simple_saved() {
-    local cidr device gateway source uuid raw entry count=0
+    local cidr device gateway source uuid raw entry spec count=0
     local -a entries=() fields=()
     IFS='|' read -r cidr device gateway source uuid <<< "$1"
+    spec=$(simple_saved_spec "$1") || simple_fail 'Cannot establish saved route format.'
     raw=$(nmcli --escape no -g ipv4.routes connection show uuid "$uuid") || simple_fail 'Cannot read saved routes.'
     [[ $raw != -- ]] || raw=''
     IFS=, read -r -a entries <<< "${raw//$'\n'/,}"
@@ -203,7 +217,11 @@ simple_saved() {
         read -r -a fields <<< "$entry"; ((${#fields[@]})) || continue
         simple_cidr "${fields[0]}" >/dev/null || simple_fail 'Unsupported nmcli route output.'
         [[ ${fields[0]} == "$cidr" ]] || continue
-        [[ ${#fields[@]} == 5 && ${fields[1]} == "$gateway" && ${fields[2]} == "$simple_metric" && ( "${fields[3]} ${fields[4]}" == "src=$source table=254" || "${fields[3]} ${fields[4]}" == "table=254 src=$source" ) ]] || simple_fail "Saved route collision for $cidr."
+        if [[ $spec == "$cidr $gateway $simple_metric table=254" ]]; then
+            [[ ${#fields[@]} == 4 && ${fields[1]} == "$gateway" && ${fields[2]} == "$simple_metric" && ${fields[3]} == table=254 ]] || simple_fail "Saved route collision for $cidr; preview --rollback --metric $simple_metric before reapplying."
+        else
+            [[ ${#fields[@]} == 5 && ${fields[1]} == "$gateway" && ${fields[2]} == "$simple_metric" && ( "${fields[3]} ${fields[4]}" == "src=$source table=254" || "${fields[3]} ${fields[4]}" == "table=254 src=$source" ) ]] || simple_fail "Saved route collision for $cidr."
+        fi
         count=$((count+1))
     done
     ((count <= 1)) || simple_fail 'Duplicate saved routes require manual cleanup.'
@@ -276,12 +294,15 @@ simple_plan() {
     done
 }
 simple_add() {
-    local record cidr device gateway source uuid status
+    local record cidr device gateway source uuid status spec
     for record in "${simple_plan_rows[@]}"; do
         IFS='|' read -r cidr device gateway source uuid <<< "$record"
         if [[ $uuid != - ]]; then
             status=$(simple_saved "$record") || simple_fail 'Saved routes changed during apply.'
-            if [[ $status == absent ]]; then nmcli connection modify uuid "$uuid" +ipv4.routes "$cidr $gateway $simple_metric src=$source table=254" || simple_fail 'Saving failed; partial changes may remain.'; fi
+            if [[ $status == absent ]]; then
+                spec=$(simple_saved_spec "$record") || simple_fail 'Cannot establish saved route format.'
+                nmcli connection modify uuid "$uuid" +ipv4.routes "$spec" || simple_fail 'Saving failed; partial changes may remain.'
+            fi
             [[ $(simple_saved "$record") == present ]] || simple_fail 'Saved route verification failed.'
         fi
         status=$(simple_live "$record") || simple_fail 'Runtime routes changed during apply.'
