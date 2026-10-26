@@ -13,7 +13,9 @@ supported. Destination routes do not guarantee symmetric replies for every sourc
 
 .PARAMETER Map
 An array of NIC_CIDR=DEST1,DEST2 strings. The selector must contain one actual NIC
-subnet. The destinations are canonical non-default IPv4 networks.
+subnet, or use /32 to match one exact assigned local IPv4 address. The actual NIC
+prefix still controls gateway validation. Destinations are canonical non-default
+IPv4 networks.
 
 .PARAMETER Gateway
 An array of NIC_CIDR=ACTUAL_GATEWAY overrides. Overrides take precedence over OS
@@ -211,8 +213,8 @@ function Get-MultiNicInventory {
 function Resolve-MultiNicSelector {
     param($Inventory, [string] $Selector, [switch] $AllowMissing)
     $prefix = Get-IPv4Prefix $Selector -Destination
-    $selected = @($Inventory.Interfaces | Where-Object { $_.PrefixLength -ge $prefix.Length -and (Test-IPv4Contains $Selector $_.Address) })
-    if ($selected.Count -gt 1) { throw "Multiple local addresses match $Selector; narrow the selector." }
+    $selected = @($Inventory.Interfaces | Where-Object { ($prefix.Length -eq 32 -or $_.PrefixLength -ge $prefix.Length) -and (Test-IPv4Contains $Selector $_.Address) })
+    if ($selected.Count -gt 1) { throw "Multiple local addresses match $Selector; resolve the ambiguity." }
     if (-not $selected.Count) {
         if ($AllowMissing) { return $null }
         throw "No actual NIC subnet matches $Selector."

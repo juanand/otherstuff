@@ -10,7 +10,9 @@ simple_usage() {
     printf '       bash %s --reset [--apply]\n' "${0##*/}"
     printf '%s\n' \
         'Azure Linux IPv4 routes. Default: read-only preview.' \
-        '  --map NIC_CIDR=DEST1,DEST2  Repeatable; unmatched NIC subnets warn and skip.' \
+        '  --map NIC_CIDR=DEST1,DEST2  Repeatable; unmatched selectors warn and skip.' \
+        '    Use a containing subnet or /32 for an exact assigned local IPv4 address.' \
+        '    The actual NIC prefix still controls gateway discovery and validation.' \
         '    Example: --map 10.0.0.0/16=10.0.0.0/8,172.20.0.0/16' \
         '  --gateway NIC_CIDR=IP      Optional subnet-gateway override; repeatable.' \
         '  --apply                    Perform reviewed route changes; root required.' \
@@ -83,8 +85,8 @@ simple_select() {
     local selector=$1 index selected=-1
     simple_canonical "$selector"
     for index in "${!simple_addresses[@]}"; do
-        if (( ${simple_addresses[index]#*/} >= ${selector#*/} )) && simple_contains "$selector" "${simple_addresses[index]%/*}"; then
-            ((selected < 0)) || simple_fail "Multiple local addresses match $selector; narrow the selector."
+        if (( ${selector#*/} == 32 || ${simple_addresses[index]#*/} >= ${selector#*/} )) && simple_contains "$selector" "${simple_addresses[index]%/*}"; then
+            ((selected < 0)) || simple_fail "Multiple local addresses match $selector; resolve the ambiguity."
             selected=$index
         fi
     done
