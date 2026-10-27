@@ -453,13 +453,17 @@ simple_netplan_change() {
     [[ $after == "$rows" ]] || simple_fail 'Saved route-only overlay verification failed.'
 }
 simple_networkd_configuration() {
-    local device=$1 index state
+    local device=$1 index reply signature resolved_index path extra state
     command -v systemctl >/dev/null || return 0
     systemctl is-active --quiet systemd-networkd || return 0
     command -v busctl >/dev/null && command -v networkctl >/dev/null || simple_fail 'Active networkd requires its installed busctl and networkctl tools.'
     read -r index < "/sys/class/net/$device/ifindex" || simple_fail 'Cannot read interface index.'
     [[ $index =~ ^[1-9][0-9]*$ ]] || simple_fail 'Invalid interface index.'
-    state=$(busctl --system --auto-start=no get-property org.freedesktop.network1 "/org/freedesktop/network1/link/_$index" org.freedesktop.network1.Link AdministrativeState) || simple_fail 'Cannot inspect per-interface networkd ownership.'
+    reply=$(busctl --system --auto-start=no call org.freedesktop.network1 /org/freedesktop/network1 org.freedesktop.network1.Manager GetLinkByName s "$device") || simple_fail 'Cannot resolve the networkd interface object.'
+    read -r signature resolved_index path extra <<< "$reply"
+    [[ $reply != *$'\n'* && $signature == io && $resolved_index == "$index" && -z $extra && $path =~ ^\"(/org/freedesktop/network1/link/[a-zA-Z0-9_]+)\"$ ]] || simple_fail 'Invalid or changed networkd interface identity.'
+    path=${BASH_REMATCH[1]}
+    state=$(busctl --system --auto-start=no get-property org.freedesktop.network1 "$path" org.freedesktop.network1.Link AdministrativeState) || simple_fail 'Cannot inspect per-interface networkd ownership.'
     case $state in
         's "unmanaged"') return 0 ;;
         's "configured"') networkctl --no-pager cat "@$device" || simple_fail 'Cannot inspect the active networkd configuration.' ;;
