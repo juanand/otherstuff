@@ -36,20 +36,11 @@ simple_os_release() (
     printf '%s\n' "$ID" "$ID_LIKE" "$VERSION_ID"
 )
 simple_check_os() {
-    local metadata family
-    local -a families=() metadata_lines=()
-    metadata=$(simple_os_release) || simple_fail 'Cannot determine the supported OS/version.'
+    local metadata
+    local -a metadata_lines=()
+    metadata=$(simple_os_release) || simple_fail 'Cannot determine OS metadata.'
     mapfile -t metadata_lines <<< "$metadata"
     printf 'OS: ID=%s VERSION_ID=%s ID_LIKE=%s\n' "${metadata_lines[0]}" "${metadata_lines[2]:-(not set)}" "${metadata_lines[1]:-(not set)}"
-    case ${metadata_lines[0]} in
-        debian) [[ ${metadata_lines[2]:-} == 13 ]] && return; simple_fail 'This development version targets Debian 13 only.' ;;
-        ubuntu) [[ ${metadata_lines[2]:-} == 26.04 ]] && return; simple_fail 'This development version targets Ubuntu 26.04 LTS only.' ;;
-    esac
-    read -r -a families <<< "${metadata_lines[0]} ${metadata_lines[1]:-}"
-    for family in "${families[@]}"; do
-        case $family in rhel|centos|fedora|rocky|almalinux|ol) return ;; esac
-    done
-    simple_fail "Unsupported OS: ${metadata//$'\n'/ }. Targets Debian 13, Ubuntu 26.04 LTS and RHEL/Fedora-derived distributions."
 }
 
 simple_number() {
@@ -118,9 +109,10 @@ simple_inventory() {
     ((${#simple_addresses[@]})) || simple_fail 'No usable global IPv4 addresses.'
     simple_routes=$(ip -N -4 -o route show table main) || simple_fail 'Cannot read routes.'
     output=$(ip -4 -o rule show) || simple_fail 'Cannot read policy rules.'
-    while read -r priority from origin lookup table rest; do
-        [[ $from == from && $origin == all && $lookup == lookup && -z $rest ]] || simple_fail 'Custom policy routing requires manual review.'
-        case "$priority$table" in 0:local|0:255|32766:main|32766:254|32767:default|32767:253) ;; *) simple_fail 'Custom policy routing requires manual review.' ;; esac
+    while IFS= read -r line; do
+        read -r priority from origin lookup table rest <<< "$line"
+        [[ $from == from && $origin == all && $lookup == lookup && -z $rest ]] || simple_fail "Custom policy routing requires manual review. Offending rule: $line"
+        case "$priority$table" in 0:local|0:255|32766:main|32766:254|32767:default|32767:253) ;; *) simple_fail "Custom policy routing requires manual review. Offending rule: $line" ;; esac
     done <<< "$output"
     while IFS= read -r line; do
         [[ $line == default\ * ]] || continue
