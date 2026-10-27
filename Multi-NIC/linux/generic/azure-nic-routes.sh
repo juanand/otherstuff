@@ -209,13 +209,25 @@ simple_netplan() {
     elif [[ -x /sbin/netplan ]]; then /sbin/netplan "$@"
     else simple_fail 'The installed Netplan CLI is required; no packages will be installed.'; fi
 }
-simple_netplan_generator() {
-    local executable
-    [[ -z ${SNAP:-} && -z ${NETPLAN_PARSER_IGNORE_ERRORS:-} ]] || simple_fail 'Unsupported Netplan execution environment.'
-    for executable in /usr/libexec/netplan/generate /usr/lib/netplan/generate /lib/netplan/generate; do
-        if [[ -x $executable ]]; then SYSTEMD_OFFLINE=1 "$executable" "$@"; return; fi
+simple_netplan_executable() {
+    local name=$1 directory
+    for directory in /usr/libexec/netplan /usr/lib/netplan /lib/netplan; do
+        if [[ -x $directory/$name ]]; then printf '%s/%s\n' "$directory" "$name"; return; fi
     done
-    simple_fail 'The installed native Netplan generator is required; no packages will be installed.'
+    return 1
+}
+simple_netplan_generator() {
+    local executable argument mapping=false
+    [[ -z ${SNAP:-} && -z ${NETPLAN_PARSER_IGNORE_ERRORS:-} ]] || simple_fail 'Unsupported Netplan execution environment.'
+    for argument in "$@"; do
+        case $argument in --mapping|--mapping=*) mapping=true ;; esac
+    done
+    if ! $mapping && executable=$(simple_netplan_executable configure); then
+        SYSTEMD_OFFLINE=1 "$executable" "$@"
+        return
+    fi
+    executable=$(simple_netplan_executable generate) || simple_fail 'An installed native Netplan configure/generate executable is required; no packages will be installed.'
+    SYSTEMD_OFFLINE=1 "$executable" "$@"
 }
 simple_netplan_mapping() {
     local device=$1 root=${2:-} output identifier backend renamed matched mac driver address
