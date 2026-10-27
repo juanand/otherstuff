@@ -40,6 +40,7 @@ simple_check_os() {
     local -a families=() metadata_lines=()
     metadata=$(simple_os_release) || simple_fail 'Cannot determine the supported OS/version.'
     mapfile -t metadata_lines <<< "$metadata"
+    printf 'OS: ID=%s VERSION_ID=%s ID_LIKE=%s\n' "${metadata_lines[0]}" "${metadata_lines[2]:-(not set)}" "${metadata_lines[1]:-(not set)}"
     case ${metadata_lines[0]} in
         debian) [[ ${metadata_lines[2]:-} == 13 ]] && return; simple_fail 'This development version targets Debian 13 only.' ;;
         ubuntu) [[ ${metadata_lines[2]:-} == 26.04 ]] && return; simple_fail 'This development version targets Ubuntu 26.04 LTS only.' ;;
@@ -483,7 +484,7 @@ simple_networkd_configuration() {
     esac
 }
 simple_prepare_backends() {
-    local device uuid configuration first identifier line before after
+    local device uuid configuration first identifier line before after compiler
     simple_owners=()
     for device in "${simple_devices[@]}"; do
         [[ -z ${simple_owners[$device]:-} ]] || continue
@@ -493,6 +494,7 @@ simple_prepare_backends() {
         if [[ $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
             [[ -z $configuration ]] || simple_fail 'NetworkManager and networkd both claim the same interface.'
             simple_owners[$device]=$uuid
+            printf 'BACKEND %s: NetworkManager; tool=nmcli\n' "$device"
         elif [[ -n $configuration ]]; then
             first=${configuration%%$'\n'*}
             [[ $first == '# /run/systemd/network/10-netplan-'*.network ]] || simple_fail 'Only native NetworkManager and Netplan/networkd ownership are implemented.'
@@ -506,7 +508,12 @@ simple_prepare_backends() {
             [[ $before == "$after" ]] || simple_fail 'Active and saved non-route interface settings differ; manual review required.'
             simple_owners[$device]="netplan:$identifier"
             simple_netplan_owned "$identifier" >/dev/null || simple_fail 'Cannot safely inspect the reserved route overlay.'
-        else simple_owners[$device]=unknown; fi
+            compiler=$(simple_netplan_executable configure || simple_netplan_executable generate || true)
+            printf 'BACKEND %s: Netplan -> systemd-networkd; compiler=%s\n' "$device" "${compiler##*/}"
+        else
+            simple_owners[$device]=unknown
+            printf 'BACKEND %s: unknown; no supported owner detected\n' "$device"
+        fi
     done
 }
 simple_profile() {
@@ -872,6 +879,7 @@ simple_cleanup() {
 }
 simple_main() (
     local arg operation='' metric_explicit=false record selected evidence
+    local execution=preview persistence=no
     local simple_np_work='' simple_np_source='' simple_np_snapshot=''
     local -A simple_owners=()
     trap '[[ -z $simple_np_work ]] || rm -rf -- "$simple_np_work"' EXIT
@@ -899,6 +907,10 @@ simple_main() (
     done
     [[ $simple_metric =~ ^[1-9][0-9]{0,9}$ ]] && ((10#$simple_metric <= 4294967295)) || simple_fail '--metric must be an integer from 1 through 4294967295.'
     simple_check_os
+    if $simple_apply; then execution=apply; fi
+    if $simple_persist; then persistence=yes; fi
+    if [[ -n $operation ]]; then persistence=automatic-cleanup; fi
+    printf 'MODE: %s; operation=%s; persistence=%s; runtime routes use ip\n' "$execution" "${operation:-routes}" "$persistence"
     command -v ip >/dev/null || simple_fail 'iproute2 is required.'
     if $simple_apply; then simple_root; fi
     if [[ -n $operation ]]; then
