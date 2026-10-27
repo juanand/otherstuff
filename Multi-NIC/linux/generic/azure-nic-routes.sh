@@ -11,6 +11,7 @@ simple_usage() {
     printf '       bash %s --reset [--apply]\n' "${0##*/}"
     printf '%s\n' \
         'Azure Linux IPv4 routes. Default: read-only preview.' \
+        'Recognized nm-cloud-setup source-policy rules/tables are validated and preserved.' \
         '  --map NIC_CIDR=DEST1,DEST2  Repeatable; unmatched selectors warn and skip.' \
         '    Use a containing subnet or /32 for an exact assigned local IPv4 address.' \
         '    The actual NIC prefix still controls gateway discovery and validation.' \
@@ -93,8 +94,101 @@ simple_select() {
     ((selected >= 0)) || return 2
     printf '%s\n' "$selected"
 }
+simple_cloud_policy() {
+    local rules=$1 line category priority source table index selected device number prefix network subnet evidence gateway uuid output
+    local -a fields=() policy_rows=()
+    local -A mandatory=() direct=() defaults=() devices=() tables=() expected=()
+    while IFS= read -r line; do
+        read -r -a fields <<< "$line"; line=${fields[*]}; category=''
+        ((${#fields[@]})) || simple_fail 'Empty policy rule requires manual review.'
+        case $line in
+            '0: from all lookup local'|'0: from all lookup 255') category=local ;;
+            '32766: from all lookup main'|'32766: from all lookup 254') category=main ;;
+            '32767: from all lookup default'|'32767: from all lookup 253') category=default ;;
+            '30350: from all lookup main suppress_prefixlength 0 proto static'|'30350: from all lookup 254 suppress_prefixlength 0 proto static'|'30350: from all lookup main suppress_prefixlength 0 proto 4'|'30350: from all lookup 254 suppress_prefixlength 0 proto 4') category=suppress ;;
+        esac
+        if [[ -n $category ]]; then
+            [[ -z ${mandatory[$category]:-} ]] || simple_fail "Duplicate cloud policy rule: $line"
+            mandatory[$category]=yes
+            continue
+        fi
+        priority=${fields[0]%:}; source=${fields[2]:-}; table=${fields[4]:-}
+        [[ ${#fields[@]} == 7 && ${fields[0]} == "$priority:" && ${fields[1]} == from && ${fields[3]} == lookup && ${fields[5]} == proto && ${fields[6]} =~ ^(static|4)$ && $priority =~ ^[1-9][0-9]{4}$ && $table == "$priority" ]] || simple_fail "Custom policy routing requires manual review. Offending rule: $line"
+        source=${source%/32}
+        simple_number "$source" >/dev/null || simple_fail "Unsupported policy source: $line"
+        if ((priority >= 30200 && priority < 30300)); then
+            [[ -z ${direct[$source]:-} ]] || simple_fail "Duplicate cloud policy source: $line"
+            direct[$source]=$table
+        elif ((priority >= 30400 && priority < 30500)); then
+            [[ -z ${defaults[$source]:-} ]] || simple_fail "Duplicate cloud policy source: $line"
+            defaults[$source]=$table
+        else simple_fail "Custom policy routing requires manual review. Offending rule: $line"; fi
+    done <<< "$rules"
+    [[ ${#mandatory[@]} == 4 && ${#direct[@]} -gt 0 && ${#direct[@]} == ${#defaults[@]} && ${#direct[@]} == ${#simple_addresses[@]} ]] || simple_fail 'Incomplete nm-cloud-setup-compatible policy; manual review required.'
+    command -v nmcli >/dev/null || simple_fail 'Cloud policy compatibility requires native NetworkManager.'
+    for source in "${!direct[@]}"; do
+        table=${direct[$source]}
+        [[ ${defaults[$source]:-} == "$((table+200))" ]] || simple_fail 'Cloud policy source/table pairs differ.'
+        selected=-1
+        for index in "${!simple_addresses[@]}"; do
+            if [[ ${simple_addresses[index]%/*} == "$source" ]]; then
+                ((selected < 0)) || simple_fail 'Cloud policy source has multiple live interface matches.'
+                selected=$index
+            fi
+        done
+        ((selected >= 0)) || simple_fail 'Cloud policy source is not an assigned IPv4 address.'
+        device=${simple_devices[selected]}
+        [[ -z ${devices[$device]:-} ]] || simple_fail 'Cloud policy compatibility currently requires one IPv4 address per NIC.'
+        [[ -z ${tables[$table]:-} ]] || simple_fail 'Cloud policy tables are shared by multiple interfaces.'
+        devices[$device]=yes
+        tables[$table]=$device
+        uuid=$(nmcli --escape no -g GENERAL.CON-UUID device show "$device") || simple_fail 'Cannot verify cloud policy NetworkManager ownership.'
+        [[ $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || simple_fail 'Cloud policy source has no active native NetworkManager profile.'
+        evidence=$(simple_gateway "$selected") || simple_fail 'Cannot validate the cloud policy gateway.'
+        gateway=${evidence%%|*}
+        read -r number prefix network < <(simple_cidr "${simple_addresses[selected]}") || simple_fail 'Cannot validate the cloud policy subnet.'
+        ((prefix >= 2 && prefix <= 29)) || simple_fail 'Cloud policy compatibility requires an actual Azure /2 through /29 subnet.'
+        printf -v subnet '%d.%d.%d.%d/%d' "$(((network >> 24) & 255))" "$(((network >> 16) & 255))" "$(((network >> 8) & 255))" "$((network & 255))" "$prefix"
+        line="$subnet dev $device table $table proto 4 scope 253 metric 10"
+        [[ -z ${expected[$line]:-} ]] || simple_fail 'Cloud policy tables are shared by multiple interfaces.'
+        expected[$line]=yes
+        expected["default via $gateway dev $device table $((table+200)) proto 4 metric 10"]=yes
+    done
+    output=$(ip -N -4 -o route show table all) || simple_fail 'Cannot inspect cloud policy route tables.'
+    while IFS= read -r line; do
+        read -r -a fields <<< "$line"; line=${fields[*]}
+        table=$(simple_field "$line" table)
+        [[ -n $table && $table != 254 && $table != 255 ]] || continue
+        [[ -n ${expected[$line]:-} ]] || simple_fail "Unexpected cloud policy table route; manual review required: $line"
+        policy_rows+=("$line")
+        unset 'expected[$line]'
+    done <<< "$output"
+    ((${#expected[@]} == 0)) || simple_fail 'Missing or conflicting cloud policy table routes; manual review required.'
+    simple_cloud_rules=$rules
+    simple_cloud_routes=$(printf '%s\n' "${policy_rows[@]}" | sort) || simple_fail 'Cannot snapshot cloud policy routes.'
+}
+simple_check_policy() {
+    local output line priority from origin lookup table rest standard=true
+    simple_cloud_rules=''; simple_cloud_routes=''
+    output=$(ip -4 -o rule show) || simple_fail 'Cannot read policy rules.'
+    while IFS= read -r line; do
+        read -r priority from origin lookup table rest <<< "$line"
+        if [[ $from != from || $origin != all || $lookup != lookup || -n $rest ]]; then standard=false; break; fi
+        case "$priority$table" in 0:local|0:255|32766:main|32766:254|32767:default|32767:253) ;; *) standard=false; break ;; esac
+    done <<< "$output"
+    if ! $standard; then simple_cloud_policy "$output"; fi
+}
+simple_recheck_policy() {
+    local rules=${simple_cloud_rules:-} routes=${simple_cloud_routes:-} addresses
+    if [[ -n $rules ]]; then
+        addresses=$(ip -o -4 address show scope global) || simple_fail 'Cannot recheck cloud policy interface addresses.'
+        [[ $addresses == "$simple_cloud_addresses" ]] || simple_fail 'Cloud policy interface addresses changed since discovery; rerun the preview.'
+    fi
+    simple_check_policy
+    [[ $simple_cloud_rules == "$rules" && $simple_cloud_routes == "$routes" ]] || simple_fail 'Policy routing changed since discovery; rerun the preview. Earlier changes may remain.'
+}
 simple_inventory() {
-    local output device address rest line priority from origin lookup table primary=''
+    local output device address rest line primary=''
     simple_devices=(); simple_addresses=()
     output=$(ip -o -4 address show scope global) || simple_fail 'Cannot read IPv4 addresses.'
     while read -r _ device _ address rest; do
@@ -108,12 +202,11 @@ simple_inventory() {
     done <<< "$output"
     ((${#simple_addresses[@]})) || simple_fail 'No usable global IPv4 addresses.'
     simple_routes=$(ip -N -4 -o route show table main) || simple_fail 'Cannot read routes.'
-    output=$(ip -4 -o rule show) || simple_fail 'Cannot read policy rules.'
-    while IFS= read -r line; do
-        read -r priority from origin lookup table rest <<< "$line"
-        [[ $from == from && $origin == all && $lookup == lookup && -z $rest ]] || simple_fail "Custom policy routing requires manual review. Offending rule: $line"
-        case "$priority$table" in 0:local|0:255|32766:main|32766:254|32767:default|32767:253) ;; *) simple_fail "Custom policy routing requires manual review. Offending rule: $line" ;; esac
-    done <<< "$output"
+    simple_check_policy
+    if [[ -n $simple_cloud_rules ]]; then
+        simple_cloud_addresses=$output
+        printf 'POLICY: Verified nm-cloud-setup-compatible rules/tables; preserving source policy and using main-table destination routes.\n'
+    fi
     while IFS= read -r line; do
         [[ $line == default\ * ]] || continue
         device=$(simple_field "$line" dev)
@@ -516,6 +609,7 @@ simple_profile() {
 }
 simple_recheck_backends() {
     local device target uuid configuration identifier before after current line
+    simple_recheck_policy
     if [[ -n ${simple_np_work:-} ]]; then
         current=$(simple_netplan_manifest) || simple_fail 'Cannot recheck saved configuration.'
         [[ $current == "$simple_np_snapshot" ]] || simple_fail 'Netplan sources changed since planning; rerun the preview.'
@@ -526,6 +620,7 @@ simple_recheck_backends() {
         if command -v nmcli >/dev/null; then uuid=$(nmcli --escape no -g GENERAL.CON-UUID device show "$device" 2>/dev/null || true); fi
         configuration=$(simple_networkd_configuration "$device") || simple_fail 'Cannot recheck networking ownership.'
         if [[ $target == netplan:* ]]; then
+            [[ -z $simple_cloud_rules ]] || simple_fail 'Cloud policy compatibility requires native NetworkManager ownership.'
             [[ ! $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || simple_fail 'NetworkManager started managing a Netplan/networkd interface.'
             identifier=$(simple_netplan_mapping "$device" "$simple_np_work/current") || simple_fail 'Netplan interface identity changed.'
             [[ $target == "netplan:$identifier" && ${configuration%%$'\n'*} == "# /run/systemd/network/10-netplan-$identifier.network" ]] || simple_fail 'Active Netplan ownership changed since planning.'
@@ -632,6 +727,22 @@ simple_nm_profile() {
     [[ $value == yes || $value == true ]] || simple_fail 'Profile must already autoconnect.'
     value=$(nmcli --escape no -g connection.permissions connection show uuid "$uuid") || simple_fail 'Cannot read profile permissions.'
     [[ -z $value || $value == -- ]] || simple_fail 'User-restricted profile cannot guarantee boot activation.'
+    if [[ -n ${simple_cloud_rules:-} ]]; then
+        local raw entry attribute
+        local -a entries=() fields=()
+        value=$(nmcli --escape no -g ipv4.routing-rules connection show uuid "$uuid") || simple_fail 'Cannot inspect saved profile policy rules.'
+        [[ -z $value || $value == -- ]] || simple_fail 'Saved profile policy rules require manual review; no changes made.'
+        value=$(nmcli --escape no -g ipv4.route-table connection show uuid "$uuid") || simple_fail 'Cannot inspect saved profile route table.'
+        [[ $value == 0 || $value == 254 ]] || simple_fail 'Cloud policy persistence requires a main-table native profile.'
+        raw=$(simple_nm_profile_routes "$uuid") || simple_fail 'Cannot inspect pending profile policy routes.'
+        IFS=, read -r -a entries <<< "$raw"
+        for entry in "${entries[@]}"; do
+            read -r -a fields <<< "$entry"
+            for attribute in "${fields[@]:3}"; do
+                case $attribute in table=*) [[ $attribute == table=0 || $attribute == table=254 ]] || simple_fail 'Saved auxiliary-table routes require manual review; no changes made.' ;; esac
+            done
+        done
+    fi
     printf '%s\n' "$uuid"
 }
 simple_live() {
@@ -646,8 +757,12 @@ simple_live() {
     printf 'present\n'
 }
 simple_nm_saved_spec() {
-    local cidr device gateway source uuid method spec
+    local cidr device gateway source uuid method spec current
     IFS='|' read -r cidr device gateway source uuid <<< "$1"
+    if [[ -n ${simple_cloud_rules:-} ]]; then
+        current=$(simple_nm_profile "$device") || simple_fail 'Cannot revalidate the saved cloud policy profile.'
+        [[ $current == "$uuid" ]] || simple_fail 'Active cloud policy profile changed since planning.'
+    fi
     method=$(nmcli --escape no -g ipv4.method connection show uuid "$uuid") || simple_fail 'Cannot read profile IPv4 method.'
     spec="$cidr $gateway $simple_metric"
     case $method in
@@ -753,14 +868,19 @@ simple_add() {
         if [[ $uuid != - ]]; then
             status=$(simple_saved "$record") || simple_fail 'Saved routes changed during apply.'
             if [[ $status == absent ]]; then
+                simple_recheck_policy
                 simple_saved_add "$record"
             fi
             [[ $(simple_saved "$record") == present ]] || simple_fail 'Saved route verification failed.'
         fi
         status=$(simple_live "$record") || simple_fail 'Runtime routes changed during apply.'
-        if [[ $status == absent ]]; then ip -4 route add "$cidr" via "$gateway" dev "$device" src "$source" proto static metric "$simple_metric" || simple_fail 'Route addition failed; partial changes may remain.'; fi
+        if [[ $status == absent ]]; then
+            simple_recheck_policy
+            ip -4 route add "$cidr" via "$gateway" dev "$device" src "$source" proto static metric "$simple_metric" || simple_fail 'Route addition failed; partial changes may remain.'
+        fi
         [[ $(simple_live "$record") == present ]] || simple_fail 'Runtime route verification failed.'
     done
+    simple_recheck_policy
     [[ $(ip -N -4 -o route show table main default) == "$(printf '%s\n' "$simple_routes" | grep '^default ' || true)" ]] || simple_fail 'Default routes changed; inspect concurrent configuration.'
     printf 'Applied. Persistence=%s. No profiles were reactivated.\n' "$simple_persist"
 }
@@ -841,11 +961,16 @@ simple_cleanup() {
     current=$(ip -N -4 -o route show table main) || simple_fail 'Cannot recheck routes before removal.'
     [[ $current == "$simple_routes" ]] || simple_fail 'Routes changed during planning; rerun the preview.'
     for index in "${!uuids[@]}"; do
+        if [[ -n $simple_cloud_rules ]]; then
+            current=$(simple_nm_profile "${targets[index]}") || simple_fail 'Cannot revalidate cloud policy cleanup profile.'
+            [[ $current == "${uuids[index]}" ]] || simple_fail 'Cloud policy cleanup profile changed since planning.'
+        fi
         current=$(simple_profile_routes "${uuids[index]}") || simple_fail 'Cannot recheck saved routes before removal.'
         [[ $current == "${snapshots[index]}" ]] || simple_fail 'Saved routes changed during planning; rerun the preview.'
     done
     for entry in "${saved_rows[@]}"; do
         uuid=${entry%%|*}; entry=${entry#*|}
+        simple_recheck_policy
         simple_saved_remove "$uuid" "$entry"
         raw=$(simple_profile_routes "$uuid") || simple_fail 'Cannot verify saved route removal.'
         entries=(); IFS=, read -r -a entries <<< "$raw"
@@ -860,18 +985,21 @@ simple_cleanup() {
         arguments=(-4 route del "$cidr" table main proto "$protocol" dev "$device" metric "${metric:-0}")
         [[ -z $gateway ]] || arguments+=(via "$gateway")
         [[ -z $source ]] || arguments+=(src "$source")
+        simple_recheck_policy
         ip "${arguments[@]}" || simple_fail 'Live route removal failed; partial changes may remain.'
     done
     output=$(ip -N -4 -o route show table main) || simple_fail 'Cannot verify remaining routes.'
     for line in "${live_rows[@]}"; do
         [[ $'\n'"$output"$'\n' != *$'\n'"$line"$'\n'* ]] || simple_fail 'Live route removal verification failed.'
     done
+    simple_recheck_policy
     [[ $(printf '%s\n' "$output" | grep '^default ' || true) == "$(printf '%s\n' "$simple_routes" | grep '^default ' || true)" ]] || simple_fail 'Default routes changed; inspect concurrent configuration.'
     printf '%s completed. Only custom route entries were removed; no profiles were reactivated.\n' "$mode"
 }
 simple_main() (
     local arg operation='' metric_explicit=false record selected evidence
     local execution=preview persistence=no
+    local simple_cloud_rules='' simple_cloud_routes='' simple_cloud_addresses=''
     local simple_np_work='' simple_np_source='' simple_np_snapshot=''
     local -A simple_owners=()
     trap '[[ -z $simple_np_work ]] || rm -rf -- "$simple_np_work"' EXIT
