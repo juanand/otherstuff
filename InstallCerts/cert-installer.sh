@@ -176,7 +176,7 @@ collect_managed_configuration() {
         [[ -f $target && -r $target && ! -L $target ]] || continue
         first_line=''
         IFS= read -r first_line < "$target" || true
-        if [[ $first_line == '# Managed by InstallCert' ]]; then
+        if [[ $first_line == "$managed_marker" ]]; then
             managed_configuration_files+=("$target")
         fi
     done
@@ -193,7 +193,7 @@ remove_managed_configuration() {
             fail "Managed configuration changed during preflight: $target. Refusing removal."
         first_line=''
         IFS= read -r first_line < "$target" || true
-        [[ $first_line == '# Managed by InstallCert' ]] ||
+        [[ $first_line == "$managed_marker" ]] ||
             fail "Configuration ownership changed during preflight: $target. Refusing removal."
         rm -f -- "$target"
         message "Removed installer configuration: $target"
@@ -351,7 +351,7 @@ case $1 in
     --validate-only) validate_only=1; shift ;;
     --removecerts) remove_certs=1; shift ;;
     --removevars) remove_vars=1; shift ;;
-    --remove|--removeall) remove_certs=1; remove_vars=1; shift ;;
+    --removeall) remove_certs=1; remove_vars=1; shift ;;
     --applycerts) apply_certs=1; shift ;;
     --applyvars) apply_vars=1; shift ;;
     --applyall) apply_certs=1; apply_vars=1; shift ;;
@@ -367,7 +367,6 @@ case $1 in
             '  --removecerts    Remove certificates selected by certs/*.crt only.' \
             '  --removevars     Remove installer CA environment settings only.' \
             '  --removeall      Remove certificates and environment settings.' \
-            '  --remove         Alias for --removeall.' \
             '' \
             'Options:' \
             '  --validate-only  Check the selected actions without changing files or trust.' \
@@ -475,6 +474,7 @@ fi
 
 configuration_name=${0##*/}
 configuration_name=${configuration_name%.sh}
+managed_marker="# Managed by $configuration_name"
 ca_profile=/etc/profile.d/$configuration_name.sh
 ca_systemd=/etc/systemd/system.conf.d/$configuration_name.conf
 if (( apply_vars || remove_vars )); then
@@ -488,7 +488,7 @@ if (( apply_vars || remove_vars )); then
         if [[ -e $target ]]; then
             [[ -f $target ]] || fail "Not a regular file: $target"
             IFS= read -r first_line < "$target" || true
-            [[ ${first_line:-} == '# Managed by InstallCert' ]] || fail "Refusing to overwrite an unowned file: $target"
+            [[ ${first_line:-} == "$managed_marker" ]] || fail "Refusing to overwrite an unowned file: $target"
         fi
     done
     [[ ! -L /etc/environment && ( ! -e /etc/environment || -f /etc/environment ) ]] || fail '/etc/environment must be a regular file, not a symbolic link.'
@@ -570,14 +570,14 @@ printf 'JAVA_TOOL_OPTIONS="%s"\n' "$java_options" >> "$temporary"
 mv -f -- "$temporary" /etc/environment
 
 mkdir -p -m 0755 -- /etc/profile.d /etc/systemd/system.conf.d
-printf '# Managed by InstallCert\n' > "$ca_profile"
+printf '%s\n' "$managed_marker" > "$ca_profile"
 for name in REQUESTS_CA_BUNDLE CURL_CA_BUNDLE SSL_CERT_FILE NODE_EXTRA_CA_CERTS; do
     printf 'export %s="%s"\n' "$name" "$bundle" >> "$ca_profile"
 done
 printf 'if [ "${JAVA_TOOL_OPTIONS+x}" != x ]; then\n    export JAVA_TOOL_OPTIONS="%s"\nelse\n    case " $JAVA_TOOL_OPTIONS " in\n        *" -Djavax.net.ssl.trustStore="*) ;;\n        *) export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-Djavax.net.ssl.trustStore=%s" ;;\n    esac\nfi\n' \
     "$java_options" "$java_truststore" >> "$ca_profile"
-printf '# Managed by InstallCert\n[Manager]\nDefaultEnvironment="REQUESTS_CA_BUNDLE=%s" "CURL_CA_BUNDLE=%s" "SSL_CERT_FILE=%s" "NODE_EXTRA_CA_CERTS=%s" "JAVA_TOOL_OPTIONS=%s"\n' \
-    "$bundle" "$bundle" "$bundle" "$bundle" "${java_options//%/%%}" > "$ca_systemd"
+printf '%s\n[Manager]\nDefaultEnvironment="REQUESTS_CA_BUNDLE=%s" "CURL_CA_BUNDLE=%s" "SSL_CERT_FILE=%s" "NODE_EXTRA_CA_CERTS=%s" "JAVA_TOOL_OPTIONS=%s"\n' \
+    "$managed_marker" "$bundle" "$bundle" "$bundle" "$bundle" "${java_options//%/%%}" > "$ca_systemd"
 chmod 0644 -- "$ca_profile" "$ca_systemd"
 if command -v restorecon >/dev/null 2>&1; then
     restorecon -F -- /etc/environment "$ca_profile" "$ca_systemd"
