@@ -714,19 +714,33 @@ simple_saved_remove() {
     else nmcli connection modify uuid "$target" -ipv4.routes "$entry" || simple_fail 'Saved route removal failed; partial changes may remain.'; fi
 }
 simple_nm_profile() {
-    local device=$1 uuid files file_uuid filename matches=0 stored='' value
+    local device=$1 uuid files file_uuid filename matches=0 stored='' locations='' value
     command -v nmcli >/dev/null || simple_fail '--persist requires active NetworkManager and nmcli.'
-    uuid=$(nmcli --escape no -g GENERAL.CON-UUID device show "$device") || simple_fail 'Cannot read active profile.'
-    [[ $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || simple_fail 'NIC has no unique active NetworkManager profile.'
-    files=$(nmcli --terse --escape no -f UUID,FILENAME connection show) || simple_fail 'Cannot inspect profile storage.'
+    uuid=$(nmcli --escape no -g GENERAL.CON-UUID device show "$device") || simple_fail "Cannot read active profile for interface=$device."
+    [[ $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || simple_fail "NIC has no unique active NetworkManager profile: interface=$device uuid=${uuid:-(none)}."
+    files=$(nmcli --terse --escape no -f UUID,FILENAME connection show) || simple_fail "Cannot inspect profile storage: interface=$device uuid=$uuid."
     while IFS=: read -r file_uuid filename; do
-        [[ $file_uuid != "$uuid" ]] || { matches=$((matches+1)); stored=$filename; }
+        if [[ $file_uuid == "$uuid" ]]; then
+            matches=$((matches+1)); stored=$filename
+            locations+="${locations:+, }${filename:-(none)}"
+        fi
     done <<< "$files"
-    [[ $matches == 1 && $stored == /etc/* ]] || simple_fail 'Persistence requires a disk-backed profile under /etc.'
+    [[ $matches == 1 ]] || simple_fail "Cannot identify a unique stored NetworkManager profile: interface=$device uuid=$uuid matches=$matches paths=${locations:-(none)}. Inspect 'nmcli --terse --escape no -f UUID,FILENAME connection show' and resolve ownership before retrying; no profile is saved automatically."
+    if [[ $stored != /etc/* ]]; then
+        printf 'PROFILE: interface=%s uuid=%s storage=%s\n' "$device" "$uuid" "${stored:-(none)}" >&2
+        case $stored in
+            /run/*) printf '%s\n' 'HINT: Profile storage is under /run; route persistence across reboot cannot be guaranteed.' >&2 ;;
+            ''|'--') printf '%s\n' 'HINT: NetworkManager reported no profile filename; disk-backed storage cannot be established.' >&2 ;;
+            *) printf '%s\n' 'HINT: Storage outside /etc is not accepted; review the vendor or configuration generator that owns this profile.' >&2 ;;
+        esac
+        printf 'HINT: Read-only inspection: sudo nmcli --fields connection,ipv4 connection show uuid %s\n' "$uuid" >&2
+        printf '%s\n' 'HINT: See README-Generic.md, Known Issues, for manual preparation after ownership review. Do not copy generated profiles blindly or restart/reactivate networking; no profile is saved automatically.' >&2
+        simple_fail "Persistence requires a disk-backed profile under /etc: interface=$device uuid=$uuid storage=${stored:-(none)}."
+    fi
     value=$(nmcli --escape no -g connection.autoconnect connection show uuid "$uuid") || simple_fail 'Cannot read autoconnect.'
-    [[ $value == yes || $value == true ]] || simple_fail 'Profile must already autoconnect.'
+    [[ $value == yes || $value == true ]] || simple_fail "Profile must already autoconnect: interface=$device uuid=$uuid storage=$stored."
     value=$(nmcli --escape no -g connection.permissions connection show uuid "$uuid") || simple_fail 'Cannot read profile permissions.'
-    [[ -z $value || $value == -- ]] || simple_fail 'User-restricted profile cannot guarantee boot activation.'
+    [[ -z $value || $value == -- ]] || simple_fail "User-restricted profile cannot guarantee boot activation: interface=$device uuid=$uuid storage=$stored."
     if [[ -n ${simple_cloud_rules:-} ]]; then
         local raw entry attribute
         local -a entries=() fields=()
