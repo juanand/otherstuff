@@ -154,9 +154,18 @@ simple_cloud_policy() {
         expected[$line]=yes
         expected["default via $gateway dev $device table $((table+200)) proto 4 metric 10"]=yes
     done
-    output=$(ip -N -4 -o route show table all) || simple_fail 'Cannot inspect cloud policy route tables.'
+    output=$(ip -4 -o route show table all) || simple_fail 'Cannot inspect cloud policy route tables.'
     while IFS= read -r line; do
-        read -r -a fields <<< "$line"; line=${fields[*]}
+        read -r -a fields <<< "$line"
+        for ((index=1; index<${#fields[@]}; index++)); do
+            case "${fields[index-1]}:${fields[index]}" in
+                table:main) fields[index]=254 ;;
+                table:local) fields[index]=255 ;;
+                proto:static) fields[index]=4 ;;
+                scope:link) fields[index]=253 ;;
+            esac
+        done
+        line=${fields[*]}
         table=$(simple_field "$line" table)
         [[ -n $table && $table != 254 && $table != 255 ]] || continue
         [[ -n ${expected[$line]:-} ]] || simple_fail "Unexpected cloud policy table route; manual review required: $line"
@@ -201,7 +210,7 @@ simple_inventory() {
         printf 'NIC %s %s\n' "$device" "$address"
     done <<< "$output"
     ((${#simple_addresses[@]})) || simple_fail 'No usable global IPv4 addresses.'
-    simple_routes=$(ip -N -4 -o route show table main) || simple_fail 'Cannot read routes.'
+    simple_routes=$(ip -4 -o route show table main) || simple_fail 'Cannot read routes.'
     simple_check_policy
     if [[ -n $simple_cloud_rules ]]; then
         simple_cloud_addresses=$output
@@ -762,7 +771,7 @@ simple_nm_profile() {
 simple_live() {
     local cidr device gateway source uuid line preferred
     IFS='|' read -r cidr device gateway source uuid <<< "$1"
-    line=$(ip -N -4 -o route show table main exact "$cidr") || simple_fail 'Cannot inspect route.'
+    line=$(ip -4 -o route show table main exact "$cidr") || simple_fail 'Cannot inspect route.'
     if [[ -z $line ]]; then printf 'absent\n'; return; fi
     [[ $line != *$'\n'* && $line != *nexthop* && $(simple_field "$line" dev) == "$device" ]] || simple_fail "Route collision for $cidr."
     if [[ -z $(simple_field "$line" via) && $(simple_field "$line" scope) =~ ^(link|253)$ ]]; then printf 'direct\n'; return; fi
@@ -875,7 +884,7 @@ simple_plan() {
     done
 }
 simple_add() {
-    local record cidr device gateway source uuid status
+    local record cidr device gateway source uuid status defaults
     simple_recheck_backends
     for record in "${simple_plan_rows[@]}"; do
         IFS='|' read -r cidr device gateway source uuid <<< "$record"
@@ -895,7 +904,8 @@ simple_add() {
         [[ $(simple_live "$record") == present ]] || simple_fail 'Runtime route verification failed.'
     done
     simple_recheck_policy
-    [[ $(ip -N -4 -o route show table main default) == "$(printf '%s\n' "$simple_routes" | grep '^default ' || true)" ]] || simple_fail 'Default routes changed; inspect concurrent configuration.'
+    defaults=$(ip -4 -o route show table main default) || simple_fail 'Cannot verify default routes.'
+    [[ $defaults == "$(printf '%s\n' "$simple_routes" | grep '^default ' || true)" ]] || simple_fail 'Default routes changed; inspect concurrent configuration.'
     printf 'Applied. Persistence=%s. No profiles were reactivated.\n' "$simple_persist"
 }
 simple_nm_profile_routes() {
@@ -972,7 +982,7 @@ simple_cleanup() {
     $simple_apply || { printf 'DRY RUN: No changes. Add --apply to remove these routes.\n'; return; }
     [[ -z ${SSH_CONNECTION:-} ]] || simple_fail 'Route cleanup must be run from a console, not an SSH session.'
     simple_recheck_backends
-    current=$(ip -N -4 -o route show table main) || simple_fail 'Cannot recheck routes before removal.'
+    current=$(ip -4 -o route show table main) || simple_fail 'Cannot recheck routes before removal.'
     [[ $current == "$simple_routes" ]] || simple_fail 'Routes changed during planning; rerun the preview.'
     for index in "${!uuids[@]}"; do
         if [[ -n $simple_cloud_rules ]]; then
@@ -1002,7 +1012,7 @@ simple_cleanup() {
         simple_recheck_policy
         ip "${arguments[@]}" || simple_fail 'Live route removal failed; partial changes may remain.'
     done
-    output=$(ip -N -4 -o route show table main) || simple_fail 'Cannot verify remaining routes.'
+    output=$(ip -4 -o route show table main) || simple_fail 'Cannot verify remaining routes.'
     for line in "${live_rows[@]}"; do
         [[ $'\n'"$output"$'\n' != *$'\n'"$line"$'\n'* ]] || simple_fail 'Live route removal verification failed.'
     done
