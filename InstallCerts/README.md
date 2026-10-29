@@ -1,6 +1,6 @@
 # Install and Remove Trusted CA Certificates
 
-This vibe-coded script explicitly applies or removes local CA certificates, CA environment defaults, or both on Debian/Ubuntu and RHEL/Fedora systems. Without parameters it only displays help, including when run with sudo. Certificate removal matches certificate thumbprints without requiring installation records or a backup directory.
+This vibe-coded script explicitly applies or removes local CA certificates, CA environment defaults, or both on Debian/Ubuntu and RHEL/Fedora systems from relative `./certs` folder. Without parameters it only displays help, including when run with sudo. Certificate removal matches certificate thumbprints without requiring installation records or a backup directory.
 
 ## Requirements
 

@@ -1,4 +1,4 @@
-# InstallCerts Agent Guidelines
+# Agent Guidelines
 
 ## Purpose and Current State
 
